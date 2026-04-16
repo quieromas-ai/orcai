@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="orchai-logo.png" alt="orcai">
+</p>
+
 # orcai-slack
 
 An event-driven framework that connects your Slack workspace to Claude Code (or Cursor) agents running 24/7 on your own infrastructure. Send a message, get code written.
