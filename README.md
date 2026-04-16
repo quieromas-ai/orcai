@@ -48,8 +48,7 @@ orcai-slack/
     ├── AGENTS.example.md
     └── .claude/
         └── agents/
-            ├── engineer.md   # Software engineer agent example
-            └── pm.md         # Product manager agent example
+            └── engineer.md   # Software engineer agent example
 ```
 
 ---
@@ -144,7 +143,7 @@ Both work. The difference is UX and isolation:
 | Setup | Simpler | One extra manifest per agent |
 | Credential isolation | Shared token | Separate tokens, separate rate limits |
 
-**One app is fine for personal use.** Separate apps make the Slack conversation look like a real team — `@Engineer` and `@PM` as distinct participants — which matters when sharing the workspace with others.
+**One app is fine for personal use.** Separate apps make the Slack conversation look like a real team — `@Engineer` and `@Reviewer` as distinct participants — which matters when sharing the workspace with others.
 
 ### Configuration
 
@@ -166,15 +165,15 @@ agents:
       bot_token_env: "ENGINEER_SLACK_BOT_TOKEN"
       app_token_env: "ENGINEER_SLACK_APP_TOKEN"
 
-  - name: "pm"
+  - name: "reviewer"
     backend: "claude"
     model: "claude-sonnet-4-6"
     timeout_minutes: 60
     slack:
       channels:
-        - "#pm-requests"
-      bot_token_env: "PM_SLACK_BOT_TOKEN"
-      app_token_env: "PM_SLACK_APP_TOKEN"
+        - "#code-reviews"
+      bot_token_env: "REVIEWER_SLACK_BOT_TOKEN"
+      app_token_env: "REVIEWER_SLACK_APP_TOKEN"
 ```
 
 In `<workspace>/.env`:
@@ -182,8 +181,8 @@ In `<workspace>/.env`:
 ```dotenv
 ENGINEER_SLACK_BOT_TOKEN=xoxb-...
 ENGINEER_SLACK_APP_TOKEN=xapp-...
-PM_SLACK_BOT_TOKEN=xoxb-...
-PM_SLACK_APP_TOKEN=xapp-...
+REVIEWER_SLACK_BOT_TOKEN=xoxb-...
+REVIEWER_SLACK_APP_TOKEN=xapp-...
 ```
 
 > **Sharing one app:** set both agents' `bot_token_env` / `app_token_env` to the same variable names. The channel is the routing key — each channel maps to exactly one agent regardless of how many share the same bot token.
@@ -213,7 +212,7 @@ my-workspace/
 
 **`AGENTS.md`** is what makes the agent useful. Describe: where repos are cloned, which CLIs are installed, branching conventions, how to reference issues, who to @mention in summaries. Copy `projects/AGENTS.example.md` as a starting point.
 
-The agent definition at `.claude/agents/<name>.md` sets the system prompt, model, and permissions. Two working examples — `engineer.md` and `pm.md` — are included in `projects/.claude/agents/`.
+The agent definition at `.claude/agents/<name>.md` sets the system prompt, model, and permissions. A working example — `engineer.md` — is included in `projects/.claude/agents/`.
 
 ---
 

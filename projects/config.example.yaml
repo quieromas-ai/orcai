@@ -33,12 +33,12 @@ agent:
 #       bot_token_env: "ENGINEER_SLACK_BOT_TOKEN"
 #       app_token_env: "ENGINEER_SLACK_APP_TOKEN"
 #
-#   - name: "pm"
+#   - name: "reviewer"
 #     backend: "claude"
 #     model: "claude-sonnet-4-6"
 #     timeout_minutes: 60
 #     slack:
 #       channels:
-#         - "#pm-requests"
-#       bot_token_env: "PM_SLACK_BOT_TOKEN"
-#       app_token_env: "PM_SLACK_APP_TOKEN"
+#         - "#code-reviews"
+#       bot_token_env: "REVIEWER_SLACK_BOT_TOKEN"
+#       app_token_env: "REVIEWER_SLACK_APP_TOKEN"
