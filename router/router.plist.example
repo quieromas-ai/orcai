@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd service for orcai-slack router.
+
+  1. Copy to ~/Library/LaunchAgents/ai.orcai.router.plist
+  2. Replace /path/to/orcai-slack with your actual clone path
+  3. Run: launchctl load ~/Library/LaunchAgents/ai.orcai.router.plist
+
+  Useful commands:
+    launchctl unload ~/Library/LaunchAgents/ai.orcai.router.plist   # stop & disable
+    launchctl start ai.orcai.router                                   # start manually
+    launchctl stop ai.orcai.router                                    # stop manually
+    tail -f /path/to/orcai-slack/router/logs/launchd.log              # follow logs
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.orcai.router</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/orcai-slack/router/.venv/bin/python</string>
+    <string>-m</string>
+    <string>router</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/path/to/orcai-slack</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/path/to/orcai-slack/router/logs/launchd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/path/to/orcai-slack/router/logs/launchd.log</string>
+</dict>
+</plist>

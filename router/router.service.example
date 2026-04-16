@@ -1,0 +1,20 @@
+# Copy to /etc/systemd/system/router.service and adjust paths and User=.
+# Then: sudo systemctl daemon-reload && sudo systemctl enable --now router
+#
+# Tip: set Environment=PATH=... in [Service] if claude/gh/az are outside the default systemd PATH.
+
+[Unit]
+Description=Router - Slack to Agent relay
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/your-clone
+ExecStart=/path/to/your-clone/router/.venv/bin/python -m router.router
+Restart=always
+RestartSec=10
+SyslogIdentifier=router
+
+[Install]
+WantedBy=multi-user.target

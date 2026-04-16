@@ -1,0 +1,23 @@
+# General
+.env
+config.yaml
+logs/
+
+# VM-specific systemd unit backup (never commit)
+*.service.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

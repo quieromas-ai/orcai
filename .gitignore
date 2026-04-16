@@ -1,0 +1,13 @@
+# Local clones / sandboxes
+worktrees/
+
+# Local config (root-level only — projects/.claude/ is intentionally tracked)
+.cursor
+/.claude
+/CLAUDE.md
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/

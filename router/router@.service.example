@@ -1,0 +1,22 @@
+# Template unit: copy to /etc/systemd/system/router@.service
+# Instance name selects config: router@staging uses router/config-staging.yaml
+#
+#   sudo systemctl enable --now router@staging
+#
+# Adjust WorkingDirectory, User, and ExecStart paths to match your clone.
+
+[Unit]
+Description=Router - Slack to Agent relay (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/your-clone
+ExecStart=/path/to/your-clone/router/.venv/bin/python -m router.router --config /path/to/your-clone/router/config-%i.yaml
+Restart=always
+RestartSec=10
+SyslogIdentifier=router-%i
+
+[Install]
+WantedBy=multi-user.target

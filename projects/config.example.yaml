@@ -1,0 +1,44 @@
+# Copy to config.yaml in this directory (gitignored).
+#
+# Single-agent schema — tokens in router/.env
+project:
+  name: "my-project"
+  platform: "github"        # "github" or "azure_devops"
+
+slack:
+  channels:
+    - "#engineering-bots"
+
+agent:
+  name: "engineer"          # matches .claude/agents/<name>.md
+  backend: "claude"         # "claude" or "cursor"
+  model: "claude-sonnet-4-6"
+  timeout_minutes: 60
+
+
+# ---
+# Multi-agent schema — tokens in this workspace's .env
+# project:
+#   name: "my-project"
+#   platform: "github"
+#
+# agents:
+#   - name: "engineer"
+#     backend: "claude"
+#     model: "claude-sonnet-4-6"
+#     timeout_minutes: 60
+#     slack:
+#       channels:
+#         - "#engineering-bots"
+#       bot_token_env: "ENGINEER_SLACK_BOT_TOKEN"
+#       app_token_env: "ENGINEER_SLACK_APP_TOKEN"
+#
+#   - name: "pm"
+#     backend: "claude"
+#     model: "claude-sonnet-4-6"
+#     timeout_minutes: 60
+#     slack:
+#       channels:
+#         - "#pm-requests"
+#       bot_token_env: "PM_SLACK_BOT_TOKEN"
+#       app_token_env: "PM_SLACK_APP_TOKEN"

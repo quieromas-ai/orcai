@@ -1,0 +1,10 @@
+# Local workspace — copy from *.example files
+config.yaml
+.env
+AGENTS.md
+
+logs/
+MEMORY.md
+
+# macOS
+.DS_Store
