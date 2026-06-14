@@ -5,6 +5,7 @@ worktrees/
 .cursor
 /.claude
 /CLAUDE.md
+router/router.plist
 
 # macOS
 .DS_Store

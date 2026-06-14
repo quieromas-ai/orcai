@@ -25,6 +25,7 @@ ROUTER_DIR = os.path.dirname(os.path.abspath(__file__))
 AGENT_RUNNER = os.path.join(ROUTER_DIR, "agent_runner.sh")
 ROUTER_CONFIG = os.path.join(ROUTER_DIR, "config.yaml")
 SLACK_MAX_LENGTH = 3900
+OUTBOX_POLL_SECONDS = 1.5  # how often the router relays the agent's queued proactive messages
 _MENTION_RE = re.compile(r"@(\w+)")
 _DEFAULT_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 _DEFAULT_APP_TOKEN_ENV = "SLACK_APP_TOKEN"
@@ -81,6 +82,7 @@ class ProjectConfig:
     backend: str = "claude"
     model: str = "claude-sonnet-4-6"
     timeout_minutes: int = 60
+    follow_thread: bool = False  # opt-in: deliver follow-up thread messages to the running agent
     slack_bot_token: str = ""
     slack_app_token: str = field(default="", repr=False)
     mentions: dict[str, str] = field(default_factory=dict, repr=False)
@@ -95,7 +97,8 @@ class SessionRecord:
     channel_id: str
     thread_ts: str
     created_at: datetime
-    state: str  # "running" | "idle"
+    state: str  # "running" | "draining" | "idle"
+    inbox_path: str = ""  # per-session router→live-agent IPC file (empty if untracked)
 
     @property
     def ref(self) -> str:
@@ -155,6 +158,7 @@ def load_projects(router_config_path: str) -> list[ProjectConfig]:
                         backend=agent_entry.get("backend", "claude"),
                         model=agent_entry.get("model", "claude-sonnet-4-6"),
                         timeout_minutes=agent_entry.get("timeout_minutes", 60),
+                        follow_thread=agent_entry.get("follow_thread", False),
                         slack_bot_token=workspace_env.get(bot_env) or os.environ.get(bot_env, ""),
                         slack_app_token=workspace_env.get(app_env) or os.environ.get(app_env, ""),
                     )
@@ -174,6 +178,7 @@ def load_projects(router_config_path: str) -> list[ProjectConfig]:
                     backend=agent_cfg.get("backend", "claude"),
                     model=agent_cfg.get("model", "claude-sonnet-4-6"),
                     timeout_minutes=agent_cfg.get("timeout_minutes", 60),
+                    follow_thread=agent_cfg.get("follow_thread", False),
                     slack_bot_token=os.environ.get(_DEFAULT_BOT_TOKEN_ENV, ""),
                     slack_app_token=os.environ.get(_DEFAULT_APP_TOKEN_ENV, ""),
                 )
@@ -200,6 +205,22 @@ def _extract_result(stdout_text: str) -> tuple[str, str]:
     return "", ""
 
 
+def _result_text_from_line(line: bytes) -> str:
+    """Return the result text if this stream-json line is a non-empty 'result' event, else ''.
+
+    Used to post each completed agent turn as it streams — so when the Stop hook keeps one
+    process alive across several queued messages, every answer reaches the thread (not just
+    the last 'result' that _extract_result would pick).
+    """
+    try:
+        data = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    if isinstance(data, dict) and data.get("type") == "result":
+        return data.get("result", "") or ""
+    return ""
+
+
 def _session_log_name(agent_name: str, session_number: int) -> str:
     """Return the log filename for a numbered agent session."""
     return f"session-{agent_name}-{session_number}.log"
@@ -214,6 +235,108 @@ def _session_id_from_log(log_path: str) -> str:
         return session_id
     except OSError:
         return ""
+
+
+def _inbox_path_for(workspace: str, session_ref: str) -> str:
+    """Filesystem path of the per-session inbox file (router→live-agent IPC channel)."""
+    safe = session_ref.replace("/", "-")
+    return os.path.join(workspace, ".orcai", "inbox", f"{safe}.jsonl")
+
+
+def _append_to_inbox(inbox_path: str, user: str, text: str, ts: str) -> None:
+    """Append one queued Slack message to the session inbox (atomic JSONL line append)."""
+    os.makedirs(os.path.dirname(inbox_path), exist_ok=True)
+    line = json.dumps({"ts": ts, "user": user, "text": text}, ensure_ascii=False)
+    with open(inbox_path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def _inbox_messages(inbox_path: str) -> list[dict[str, str]]:
+    """Read queued inbox messages (empty list if the file is missing or empty)."""
+    if not inbox_path:
+        return []
+    try:
+        with open(inbox_path, encoding="utf-8", errors="replace") as f:
+            raw_lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    except OSError:
+        return []
+    out: list[dict[str, str]] = []
+    for ln in raw_lines:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _clear_inbox(inbox_path: str) -> None:
+    """Remove the inbox file once its messages have been claimed."""
+    if inbox_path:
+        with contextlib.suppress(OSError):
+            os.remove(inbox_path)
+
+
+async def _add_reaction(slack_client: AsyncWebClient, channel: str, ts: str, name: str) -> None:
+    """Best-effort emoji reaction ack (used instead of a text 'picked up' message)."""
+    if not ts:
+        return
+    try:
+        await slack_client.reactions_add(channel=channel, name=name, timestamp=ts)
+    except Exception as e:
+        # WARNING (not DEBUG): a missing `reactions:write` scope or revoked token silently
+        # disables the ack reaction — it must be visible at the router's default INFO level.
+        # Surface the Slack error code (e.g. missing_scope, already_reacted, not_in_channel)
+        # since the SDK's default message only reports the HTTP status.
+        resp = getattr(e, "response", None)
+        code = ""
+        if resp is not None:
+            with contextlib.suppress(Exception):
+                code = f" ({resp['error']})"
+        logger.warning("Failed to add reaction :%s: in %s: %s%s", name, channel, e, code)
+
+
+def _outbox_path_for(workspace: str, session_ref: str) -> str:
+    """Filesystem path of the per-session outbox file (live-agent → router → Slack channel).
+
+    Mirror of the inbox: the agent appends proactive messages here via the `orcai-say` skill and
+    the router relays each one to Slack with the bot token — so every message comes from the one
+    bot identity and reaches the bot's own DMs/channels (which a separate MCP identity cannot).
+    """
+    safe = session_ref.replace("/", "-")
+    return os.path.join(workspace, ".orcai", "outbox", f"{safe}.jsonl")
+
+
+def _outbox_messages(outbox_path: str) -> list[dict[str, Any]]:
+    """Parsed outbox messages ({'text','dm'} per line).
+
+    Skips a trailing line with no newline — that is a concurrent append still in flight, picked
+    up on the next poll once complete.
+    """
+    if not outbox_path:
+        return []
+    try:
+        with open(outbox_path, encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError:
+        return []
+    if not data.endswith("\n"):
+        data = data[: data.rfind("\n") + 1]
+    out: list[dict[str, Any]] = []
+    for ln in data.splitlines():
+        if not ln.strip():
+            continue
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _clear_outbox(outbox_path: str) -> None:
+    """Remove the outbox file once the run is finished."""
+    if outbox_path:
+        with contextlib.suppress(OSError):
+            os.remove(outbox_path)
 
 
 def _slack_ts_sort_key(msg: dict[str, Any]) -> float:
@@ -393,12 +516,17 @@ async def spawn_engineer(
     active_tickets: dict[str, str] | None = None,
     channel_type: str = "channel",
     event_ts: str = "",
+    trigger_user: str = "",
     user_cache: dict[str, str] | None = None,
     sessions: dict[str, SessionRecord] | None = None,
     session_by_thread: dict[str, str] | None = None,
     session_counter: dict[str, int] | None = None,
     resume_session_id: str | None = None,
+    drain_session_ref: str | None = None,
 ) -> None:
+    drain_batch: list[dict[str, str]] = []
+    drain_resume_id: str | None = None
+    drain_ref: str | None = None
     try:
         async with semaphore:
             now = datetime.now(timezone.utc)
@@ -408,7 +536,21 @@ async def spawn_engineer(
 
             session_ref: str | None = None
             session_number: int = 0
-            if (
+            inbox_path: str = ""
+            is_drain = False
+            if drain_session_ref is not None and sessions is not None and (
+                drain_session_ref in sessions
+            ):
+                # Continuation of an in-flight thread conversation: reuse the SAME record,
+                # do NOT mint a new daily session number or remap session_by_thread.
+                is_drain = True
+                session_ref = drain_session_ref
+                rec = sessions[session_ref]
+                session_number = rec.number
+                inbox_path = rec.inbox_path or _inbox_path_for(project.workspace, session_ref)
+                rec.inbox_path = inbox_path
+                rec.state = "running"
+            elif (
                 sessions is not None
                 and session_counter is not None
                 and session_by_thread is not None
@@ -417,6 +559,12 @@ async def spawn_engineer(
                 session_counter[counter_key] = session_counter.get(counter_key, 0) + 1
                 session_number = session_counter[counter_key]
                 session_ref = f"{date_str}/{session_number}"
+                # Inbox (and therefore the whole follow-thread mechanism) is opt-in per agent.
+                inbox_path = (
+                    _inbox_path_for(project.workspace, session_ref)
+                    if project.follow_thread
+                    else ""
+                )
                 sessions[session_ref] = SessionRecord(
                     number=session_number,
                     date_str=date_str,
@@ -426,30 +574,28 @@ async def spawn_engineer(
                     thread_ts=thread_ts or "",
                     created_at=now,
                     state="running",
+                    inbox_path=inbox_path,
                 )
                 if thread_ts:
                     session_by_thread[f"{channel_id}:{thread_ts}"] = session_ref
 
+            # Outbox is provisioned for any tracked session so the agent can post proactive
+            # updates the router relays via the bot token (independent of inbox/follow_thread).
+            outbox_path = _outbox_path_for(project.workspace, session_ref) if session_ref else ""
+
             log_name = (
-                _session_log_name(project.agent_name, session_number)
+                # Distinct log per drain cycle so the canonical session log isn't clobbered.
+                f"{_session_log_name(project.agent_name, session_number)[:-4]}-{now:%H%M%S}.log"
+                if is_drain
+                else _session_log_name(project.agent_name, session_number)
                 if session_ref
                 else now.strftime("%H%M%S") + ".log"
             )
             log_path = os.path.join(log_dir, log_name)
 
-            pickup_kwargs: dict[str, Any] = {
-                "channel": channel_id,
-                "text": (
-                    f"Picked up by *{project.agent_name}*"
-                    + (f" `#{session_ref}`..." if session_ref else "...")
-                ),
-            }
-            if thread_ts:
-                pickup_kwargs["thread_ts"] = thread_ts
-            try:
-                await slack_client.chat_postMessage(**pickup_kwargs)
-            except Exception as e:
-                logger.error("Failed to post pickup message: %s", e)
+            # Acknowledge pickup with a reaction on the triggering message instead of a
+            # text post — keeps threads clean during long runs.
+            await _add_reaction(slack_client, channel_id, event_ts, "eyes")
 
             context = await fetch_thread_context(
                 slack_client, channel_id, thread_ts, event_ts, channel_type, user_cache or {}
@@ -484,26 +630,97 @@ async def spawn_engineer(
             exit_code = -1
             claude_session_id = ""
 
+            # Expose the inbox path (router→agent: poll skill + PostToolUse/Stop hooks read
+            # follow-ups mid-run) and the outbox path (agent→router: the `orcai-say` skill queues
+            # proactive messages the router relays to Slack with the bot token). Inherited via exec.
+            run_env = {**os.environ}
+            if inbox_path:
+                run_env["ORCAI_INBOX"] = inbox_path
+            if outbox_path:
+                run_env["ORCAI_OUTBOX"] = outbox_path
+                # Absolute path to the outbox helper so the `orcai-say` skill never depends on
+                # $CLAUDE_PROJECT_DIR (which is unset inside headless `claude -p` agent runs).
+                run_env["ORCAI_SAY"] = os.path.join(
+                    project.workspace, ".orcai", "hooks", "outbox_say.py"
+                )
+
             with open(log_path, "wb") as log_file:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=log_file,
                     cwd=project.workspace,
+                    env=run_env,
                     limit=10 * 1024 * 1024,  # 10 MB — prevents ValueError on long JSON lines
                 )
                 stdout_lines: list[bytes] = []
+                posted_count = 0
 
                 async def _stream_stdout() -> None:
+                    nonlocal posted_count
                     assert proc.stdout is not None
                     async for line in proc.stdout:
                         log_file.write(line)
                         log_file.flush()
                         stdout_lines.append(line)
+                        # Post each completed agent turn as it arrives (one reply per answered
+                        # message when the Stop hook keeps the process alive across queued msgs).
+                        turn_text = _result_text_from_line(line)
+                        if not turn_text:
+                            continue
+                        turn_text = _resolve_mentions(turn_text, project.mentions)
+                        if len(turn_text) > SLACK_MAX_LENGTH:
+                            turn_text = turn_text[:SLACK_MAX_LENGTH] + "\n... (truncated)"
+                        turn_kwargs: dict[str, Any] = {"channel": channel_id, "text": turn_text}
+                        if thread_ts:
+                            turn_kwargs["thread_ts"] = thread_ts
+                        try:
+                            await slack_client.chat_postMessage(**turn_kwargs)
+                            posted_count += 1
+                        except Exception as e:
+                            logger.error("Failed to post Slack turn: %s", e)
+
+                posted_outbox = 0
+
+                async def _flush_outbox() -> None:
+                    # Relay each new queued message via the BOT token: in-thread (dm falsy) or as
+                    # an escalation DM to the triggering user (dm truthy). Advance the offset before
+                    # posting so a failed post is not retried forever.
+                    nonlocal posted_outbox
+                    msgs = _outbox_messages(outbox_path)
+                    for m in msgs[posted_outbox:]:
+                        posted_outbox += 1
+                        text = _resolve_mentions(str(m.get("text", "")), project.mentions)
+                        if not text:
+                            continue
+                        if len(text) > SLACK_MAX_LENGTH:
+                            text = text[:SLACK_MAX_LENGTH] + "\n... (truncated)"
+                        if m.get("dm"):
+                            target = trigger_user or channel_id
+                            out_kwargs: dict[str, Any] = {"channel": target, "text": text}
+                        else:
+                            out_kwargs = {"channel": channel_id, "text": text}
+                            if thread_ts:
+                                out_kwargs["thread_ts"] = thread_ts
+                        if not out_kwargs["channel"]:
+                            continue
+                        try:
+                            await slack_client.chat_postMessage(**out_kwargs)
+                        except Exception as e:
+                            logger.warning("Failed to relay outbox message: %s", e)
+
+                async def _drain_outbox() -> None:
+                    # Poll the outbox while the agent runs, then flush once more after it exits.
+                    if not outbox_path:
+                        return
+                    while proc.returncode is None:
+                        await _flush_outbox()
+                        await asyncio.sleep(OUTBOX_POLL_SECONDS)
+                    await _flush_outbox()
 
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(_stream_stdout(), proc.wait()),
+                        asyncio.gather(_stream_stdout(), proc.wait(), _drain_outbox()),
                         timeout=project.timeout_minutes * 60,
                     )
                     exit_code = proc.returncode if proc.returncode is not None else -1
@@ -530,22 +747,42 @@ async def spawn_engineer(
                         proc.kill()
                     await proc.wait()
 
+            # The outbox was fully relayed during the run (final flush in _drain_outbox); remove
+            # it so a resumed/drained continuation of this session starts from a clean file.
+            _clear_outbox(outbox_path)
+
+            # ---- Race-safe post-run transition: decided synchronously, BEFORE any await, so
+            # there is never a moment where the record reads "idle" while its inbox is
+            # non-empty. A message arriving during the Slack posts below therefore sees
+            # "draining" and enqueues instead of forking a parallel resume. ----
             if sessions is not None and session_ref in sessions:
                 rec = sessions[session_ref]
-                rec.claude_session_id = claude_session_id
-                rec.state = "idle"
+                rec.claude_session_id = claude_session_id or rec.claude_session_id
+                pending = _inbox_messages(rec.inbox_path)
+                if pending:
+                    _clear_inbox(rec.inbox_path)  # claim the queue synchronously
+                    drain_batch = pending
+                    drain_resume_id = rec.claude_session_id or None
+                    drain_ref = session_ref
+                    rec.state = "draining"
+                else:
+                    rec.state = "idle"
 
-            reply_text = _build_reply_text(project.name, exit_code, result_text, log_path)
-            reply_kwargs: dict[str, Any] = {"channel": channel_id, "text": reply_text}
-            if thread_ts:
-                reply_kwargs["thread_ts"] = thread_ts
+            # Post a fallback/error only when nothing was streamed to the thread (the success
+            # path already posted each turn live in _stream_stdout).
+            if posted_count == 0:
+                reply_text = _build_reply_text(project.name, exit_code, result_text, log_path)
+                reply_kwargs: dict[str, Any] = {"channel": channel_id, "text": reply_text}
+                if thread_ts:
+                    reply_kwargs["thread_ts"] = thread_ts
+                try:
+                    await slack_client.chat_postMessage(**reply_kwargs)
+                except Exception as e:
+                    logger.error("Failed to post Slack response: %s", e)
 
-            try:
-                await slack_client.chat_postMessage(**reply_kwargs)
-            except Exception as e:
-                logger.error("Failed to post Slack response: %s", e)
-
-            if exit_code == 0 and session_ref and claude_session_id:
+            # Only show the "session saved — reply to continue" banner once the conversation
+            # truly goes idle (not between queued messages mid-drain).
+            if exit_code == 0 and session_ref and claude_session_id and not drain_batch:
                 banner_kwargs: dict[str, Any] = {
                     "channel": channel_id,
                     "text": (
@@ -565,6 +802,33 @@ async def spawn_engineer(
                 project.name,
                 exit_code,
                 log_path,
+            )
+
+        # Drain queued messages AFTER releasing the semaphore (so the continuation can
+        # re-acquire its own slot — avoids a one-slot deadlock). Resumes the SAME session;
+        # falls back to a fresh prompt (thread history still supplied) when no session id
+        # survived a crash. Recurses until the inbox is empty and the record goes idle.
+        if drain_batch and drain_ref is not None:
+            newest = drain_batch[-1]
+            logger.info(
+                "Draining %d queued message(s) for session #%s", len(drain_batch), drain_ref
+            )
+            await spawn_engineer(
+                project,
+                newest.get("text", ""),
+                channel_id,
+                thread_ts,
+                slack_client,
+                semaphore,
+                channel_type=channel_type,
+                event_ts=newest.get("ts", ""),
+                trigger_user=trigger_user,
+                user_cache=user_cache,
+                sessions=sessions,
+                session_by_thread=session_by_thread,
+                session_counter=session_counter,
+                resume_session_id=drain_resume_id,
+                drain_session_ref=drain_ref,
             )
     finally:
         if ticket_key and active_tickets is not None:
@@ -684,6 +948,29 @@ async def _try_route_event(
 
     resume_session_id: str | None = None
 
+    # Serialize per thread: if this thread's agent is still alive (running or draining its
+    # inbox), deliver the message via the session inbox file so the live process picks it up
+    # mid-run — instead of forking a second parallel claude process. Decided BEFORE the
+    # idle-resume / DM-#ref paths below, which only handle the not-running cases.
+    if thread_ts and sessions is not None and session_by_thread is not None:
+        busy_ref = session_by_thread.get(f"{channel}:{thread_ts}")
+        queued_text = text
+        if channel_type == "im":
+            dm_busy = re.match(r"^#(\d{4}-\d{2}-\d{2}/\d+)\s+(.*)", text, re.DOTALL)
+            if dm_busy and sessions.get(dm_busy.group(1)):
+                busy_ref = dm_busy.group(1)
+                queued_text = dm_busy.group(2).strip()
+        if busy_ref:
+            busy_rec = sessions.get(busy_ref)
+            if busy_rec and busy_rec.state in ("running", "draining") and busy_rec.inbox_path:
+                queued_user = source.get("user", "") or source.get("username", "")
+                _append_to_inbox(busy_rec.inbox_path, queued_user, queued_text, msg_ts)
+                await _add_reaction(slack_client, channel, msg_ts, "eyes")
+                logger.info(
+                    "Thread #%s busy (%s) — queued message to inbox", busy_ref, busy_rec.state
+                )
+                return
+
     # app_mention events (human @mentions) always auto-resume in threads regardless of platform.
     # Plain message events in github/ADO channels may be integration bot posts — only auto-resume
     # those when platform is "slack". DM thread replies are also auto-resumed; fresh DMs are not.
@@ -729,6 +1016,7 @@ async def _try_route_event(
                 else:
                     logger.info("No session found for #%s — treating as new message", target_ref)
 
+    trigger_user = source.get("user", "") or source.get("username", "")
     task = asyncio.create_task(
         spawn_engineer(
             project,
@@ -741,6 +1029,7 @@ async def _try_route_event(
             active_tickets=active_tickets,
             channel_type=channel_type,
             event_ts=msg_ts,
+            trigger_user=trigger_user,
             user_cache=user_cache,
             sessions=sessions,
             session_by_thread=session_by_thread,

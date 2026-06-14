@@ -25,7 +25,7 @@ You (or GitHub/Azure DevOps bot) → Slack channel
   Slack thread reply  ←  result posted back
 ```
 
-The **router** is a lightweight async Python service connected to Slack via Socket Mode. It listens for `@BotName` mentions and integration bot messages (GitHub, Azure DevOps), spawns a `claude --agent` subprocess in the configured project workspace, and posts the result back to the Slack thread. Thread replies resume the previous Claude session automatically.
+The **router** is a lightweight async Python service connected to Slack via Socket Mode. It listens for `@BotName` mentions and integration bot messages (GitHub, Azure DevOps), spawns a `claude --agent` subprocess in the configured project workspace, and posts the result back to the Slack thread. Thread replies resume the previous Claude session automatically — and if the agent is still working, a follow-up in the same thread is queued and delivered to the running session instead of starting a second agent (see [Follow-up messages while an agent is running](#follow-up-messages-while-an-agent-is-running)).
 
 ---
 
@@ -37,7 +37,7 @@ orcai-slack/
 │   ├── router.py             # Main entry point
 │   ├── agent_runner.sh       # Spawns claude / cursor-agent
 │   ├── platforms/            # Message parsers (slack, github, azure_devops)
-│   ├── tests/                # pytest suite (123 tests)
+│   ├── tests/                # pytest suite (138 tests)
 │   ├── config.example.yaml
 │   ├── .env.example
 │   └── router.service.example
@@ -46,9 +46,14 @@ orcai-slack/
     ├── config.example.yaml
     ├── .env.example
     ├── AGENTS.example.md
-    └── .claude/
-        └── agents/
-            └── engineer.md   # Software engineer agent example
+    ├── .claude/
+    │   ├── settings.json      # inbox-delivery hooks (PostToolUse, Stop)
+    │   ├── agents/
+    │   │   └── engineer.md    # Software engineer agent example
+    │   └── skills/
+    │       └── check-inbox/   # poll skill for follow-ups mid-run
+    └── .orcai/
+        └── hooks/             # inbox_inject.sh, inbox_drain.sh, inbox_emit.py
 ```
 
 ---
@@ -159,6 +164,7 @@ agents:
     backend: "claude"
     model: "claude-sonnet-4-6"
     timeout_minutes: 60
+    follow_thread: true        # optional — queue follow-ups to the running agent (default false)
     slack:
       channels:
         - "#engineering-bots"
@@ -204,10 +210,15 @@ my-workspace/
 ├── config.yaml       # required
 ├── .env              # optional — workspace secrets, PATH overrides
 ├── AGENTS.md         # required — host context for the agent
-└── .claude/
-    ├── CLAUDE.md     # usually: "Read @AGENTS.md to get started."
-    └── agents/
-        └── engineer.md
+├── .claude/
+│   ├── CLAUDE.md     # usually: "Read @AGENTS.md to get started."
+│   ├── settings.json # optional — inbox-delivery hooks (recommended)
+│   ├── agents/
+│   │   └── engineer.md
+│   └── skills/
+│       └── check-inbox/   # optional — poll skill for follow-ups
+└── .orcai/
+    └── hooks/        # optional — inbox_inject.sh, inbox_drain.sh, inbox_emit.py
 ```
 
 **`AGENTS.md`** is what makes the agent useful. Describe: where repos are cloned, which CLIs are installed, branching conventions, how to reference issues, who to @mention in summaries. Copy `projects/AGENTS.example.md` as a starting point.
@@ -240,8 +251,21 @@ sudo systemctl daemon-reload && sudo systemctl enable --now router
 
 - **`@BotName <request>`** — strips the mention and forwards to the agent. Messages without a mention are ignored.
 - **GitHub / Azure DevOps integration bots** — forwarded automatically; no mention needed. Subscribe channels to events with `/github subscribe owner/repo issues pulls reviews comments`.
-- **Thread replies** — resume the previous Claude session, preserving full context.
+- **Thread replies (idle session)** — resume the previous Claude session, preserving full context.
+- **Thread replies (busy session)** — queued to the running agent's inbox and picked up mid-run instead of forking a second agent (see below).
+- **Pickup ack** — the triggering message gets an 👀 reaction rather than a "picked up" text reply, keeping threads clean. Requires the bot's `reactions:write` scope (included in `manifest.example.json`); apps created before this scope was added must add it under **OAuth & Permissions** and reinstall. A missing scope is logged as a `WARNING`.
+- **Proactive updates (outbox)** — a running agent can post progress mid-run via the `orcai-say` skill, which appends to `$ORCAI_OUTBOX`; the router relays each message to Slack with the **bot token** — in-thread by default, or as a DM with `--dm` for escalation. Routing through the bot (not a separate MCP identity) is what lets it post into the bot's own DMs and channels. Mirror of the inbox; the agent never calls a Slack API directly.
 - **Concurrency** — defaults to 3 concurrent agent sessions. Override with `MAX_CONCURRENT=N` in the environment.
+
+## Follow-up messages while an agent is running
+
+This is **opt-in per agent** — set `follow_thread: true` on the agent in the workspace `config.yaml` (off by default). When enabled, a follow-up in the same thread is delivered to the **already-running** agent rather than spawning a parallel one:
+
+1. The router appends the message to a per-session inbox file (`<workspace>/.orcai/inbox/<session>.jsonl`) and reacts 👀 on it — no second process is started.
+2. Workspace hooks surface it to the live agent: after each tool call (`PostToolUse`), and again if the agent tries to stop with messages still pending (`Stop`, which keeps the session alive to handle them). The agent can also poll explicitly with the `check-inbox` skill — recommended for long/async waits, run as a `sleep`+check loop.
+3. Anything that arrives after the process has already exited is drained by the router with a `--resume` continuation of the same session (a fresh prompt if a crash lost the session id).
+
+Each answered message is posted back as its own thread reply. The hooks, the `check-inbox` skill, and the "poll during long waits" guidance ship in the example workspace under `projects/.claude/` and `projects/.orcai/hooks/` — copy them into your workspace and set `follow_thread: true` on the agent to enable. They no-op outside router runs and for agents without the flag (gated on the `ORCAI_INBOX` env var the router sets only for `follow_thread` agents).
 
 ---
 
@@ -279,7 +303,7 @@ Required PAT scopes: `Code (Read & Write)`, `Pull Request Threads (Read & Write)
 cd router && .venv/bin/python -m pytest tests/ -v
 ```
 
-123 tests, no external dependencies required.
+138 tests, no external dependencies required.
 
 ---
 

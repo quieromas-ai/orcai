@@ -14,6 +14,8 @@ agent:
   backend: "claude"         # "claude" or "cursor"
   model: "claude-sonnet-4-6"
   timeout_minutes: 60
+  # follow_thread: true     # opt-in: deliver follow-up thread messages to the running agent
+                            # (needs the inbox hooks in .claude/settings.json + .orcai/hooks/)
 
 
 # ---
@@ -27,6 +29,7 @@ agent:
 #     backend: "claude"
 #     model: "claude-sonnet-4-6"
 #     timeout_minutes: 60
+#     follow_thread: true       # opt-in: queue follow-up thread messages to the running agent
 #     slack:
 #       channels:
 #         - "#engineering-bots"

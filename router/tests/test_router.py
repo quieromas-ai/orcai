@@ -1,13 +1,14 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 from collections import deque
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from datetime import datetime as real_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,9 +24,14 @@ from router import (
     supervise_slack,
 )
 from router.router import (
+    SLACK_MAX_LENGTH,
     DailyDirectoryFileHandler,
+    _add_reaction,
+    _append_to_inbox,
     _extract_result,
+    _inbox_messages,
     _is_unchanged_message_edit,
+    _outbox_path_for,
     _resolve_mentions,
     _session_id_from_log,
     _try_route_event,
@@ -294,8 +300,9 @@ async def test_spawn_engineer_success_posts_result(tmp_path: Path) -> None:
     with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
         await spawn_engineer(project, "do something", "C001", "12345.0", slack_client, semaphore)
 
-    assert slack_client.chat_postMessage.call_count == 2
-    result_kwargs = slack_client.chat_postMessage.call_args_list[1].kwargs
+    # The result is now streamed live; there is no separate "picked up" text post.
+    assert slack_client.chat_postMessage.call_count == 1
+    result_kwargs = slack_client.chat_postMessage.call_args_list[0].kwargs
     assert result_kwargs["text"] == "All done!"
     assert result_kwargs["thread_ts"] == "12345.0"
 
@@ -310,11 +317,11 @@ async def test_spawn_engineer_resolves_mentions_in_result(tmp_path: Path) -> Non
     with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
         await spawn_engineer(project, "do something", "C001", "12345.0", slack_client, semaphore)
 
-    result_kwargs = slack_client.chat_postMessage.call_args_list[1].kwargs
+    result_kwargs = slack_client.chat_postMessage.call_args_list[0].kwargs
     assert result_kwargs["text"] == "PR opened, <@U999> please check"
 
 
-async def test_spawn_engineer_sends_pickup_message_in_thread(tmp_path: Path) -> None:
+async def test_spawn_engineer_adds_reaction_to_triggering_message(tmp_path: Path) -> None:
     stdout = _stream_json("done")
     proc = _make_proc(stdout, returncode=0)
     slack_client = AsyncMock()
@@ -322,12 +329,18 @@ async def test_spawn_engineer_sends_pickup_message_in_thread(tmp_path: Path) -> 
     semaphore = asyncio.Semaphore(1)
 
     with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
-        await spawn_engineer(project, "do something", "C001", "99.0", slack_client, semaphore)
+        await spawn_engineer(
+            project, "do something", "C001", "99.0", slack_client, semaphore, event_ts="trig.1"
+        )
 
-    pickup_kwargs = slack_client.chat_postMessage.call_args_list[0].kwargs
-    assert "mybot" in pickup_kwargs["text"]
-    assert pickup_kwargs["channel"] == "C001"
-    assert pickup_kwargs["thread_ts"] == "99.0"
+    # Pickup is acked with a reaction on the triggering message, not a text post.
+    slack_client.reactions_add.assert_called_once()
+    rk = slack_client.reactions_add.call_args.kwargs
+    assert rk["channel"] == "C001"
+    assert rk["name"] == "eyes"
+    assert rk["timestamp"] == "trig.1"
+    posts = [c.kwargs.get("text", "") for c in slack_client.chat_postMessage.call_args_list]
+    assert all("Picked up" not in t for t in posts)
 
 
 async def test_spawn_engineer_pickup_message_no_thread_ts(tmp_path: Path) -> None:
@@ -344,11 +357,11 @@ async def test_spawn_engineer_pickup_message_no_thread_ts(tmp_path: Path) -> Non
     assert "thread_ts" not in pickup_kwargs
 
 
-async def test_spawn_engineer_pickup_message_includes_session_ref(tmp_path: Path) -> None:
-    stdout = _stream_json("done")
+async def test_spawn_engineer_sets_inbox_path_on_record(tmp_path: Path) -> None:
+    stdout = _stream_json_with_session("done", "uuid-7")
     proc = _make_proc(stdout, returncode=0)
     slack_client = AsyncMock()
-    project = make_project(workspace=str(tmp_path), agent_name="engineer")
+    project = make_project(workspace=str(tmp_path), agent_name="engineer", follow_thread=True)
     semaphore = asyncio.Semaphore(1)
     sessions: dict[str, Any] = {}
     session_by_thread: dict[str, str] = {}
@@ -367,12 +380,13 @@ async def test_spawn_engineer_pickup_message_includes_session_ref(tmp_path: Path
             session_counter=session_counter,
         )
 
-    pickup_text = slack_client.chat_postMessage.call_args_list[0].kwargs["text"]
-    assert "engineer" in pickup_text
-    assert "`#" in pickup_text  # session ref included
+    rec = next(iter(sessions.values()))
+    assert rec.inbox_path.endswith(".jsonl")
+    assert str(tmp_path) in rec.inbox_path
+    assert "/.orcai/inbox/" in rec.inbox_path
 
 
-async def test_spawn_pickup_no_session_ref_without_tracking(tmp_path: Path) -> None:
+async def test_spawn_engineer_no_banner_or_pickup_without_tracking(tmp_path: Path) -> None:
     stdout = _stream_json("done")
     proc = _make_proc(stdout, returncode=0)
     slack_client = AsyncMock()
@@ -382,30 +396,34 @@ async def test_spawn_pickup_no_session_ref_without_tracking(tmp_path: Path) -> N
     with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
         await spawn_engineer(project, "do something", "C001", "99.0", slack_client, semaphore)
 
-    pickup_text = slack_client.chat_postMessage.call_args_list[0].kwargs["text"]
-    assert "engineer" in pickup_text
-    assert "`#" not in pickup_text  # no session ref when tracking not configured
+    # Without session tracking: only the streamed result, no pickup text, no session banner.
+    posts = [c.kwargs.get("text", "") for c in slack_client.chat_postMessage.call_args_list]
+    assert posts == ["done"]
 
 
-async def test_spawn_engineer_pickup_message_sent_before_result(tmp_path: Path) -> None:
+async def test_spawn_engineer_reaction_added_before_result(tmp_path: Path) -> None:
     stdout = _stream_json("result text")
     proc = _make_proc(stdout, returncode=0)
     slack_client = AsyncMock()
     call_order: list[str] = []
 
-    async def record_call(**kwargs: object) -> None:
-        call_order.append(str(kwargs.get("text", "")))
+    async def record_react(**kwargs: object) -> None:
+        call_order.append("react")
 
-    slack_client.chat_postMessage.side_effect = record_call
+    async def record_post(**kwargs: object) -> None:
+        call_order.append("post:" + str(kwargs.get("text", "")))
+
+    slack_client.reactions_add.side_effect = record_react
+    slack_client.chat_postMessage.side_effect = record_post
     project = make_project(workspace=str(tmp_path), agent_name="engineer")
     semaphore = asyncio.Semaphore(1)
 
     with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
-        await spawn_engineer(project, "do something", "C001", "ts1", slack_client, semaphore)
+        await spawn_engineer(
+            project, "do something", "C001", "ts1", slack_client, semaphore, event_ts="trig.1"
+        )
 
-    assert len(call_order) == 2
-    assert "engineer" in call_order[0]
-    assert call_order[1] == "result text"
+    assert call_order == ["react", "post:result text"]
 
 
 async def test_spawn_engineer_log_written_to_workspace(tmp_path: Path) -> None:
@@ -1480,9 +1498,9 @@ async def test_spawn_engineer_posts_banner_on_success(tmp_path: Path) -> None:
             session_counter=session_counter,
         )
 
-    # pickup + result + banner
-    assert slack_client.chat_postMessage.call_count == 3
-    banner_text: str = slack_client.chat_postMessage.call_args_list[2].kwargs["text"]
+    # streamed result + banner (no separate pickup text post)
+    assert slack_client.chat_postMessage.call_count == 2
+    banner_text: str = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
     assert "Session" in banner_text
     assert "/1" in banner_text
     assert "reply here" in banner_text
@@ -1510,8 +1528,8 @@ async def test_spawn_engineer_no_banner_on_failure(tmp_path: Path) -> None:
             session_counter=session_counter,
         )
 
-    # pickup + error only, no banner
-    assert slack_client.chat_postMessage.call_count == 2
+    # error only (no pickup text, no banner)
+    assert slack_client.chat_postMessage.call_count == 1
 
 
 async def test_spawn_engineer_passes_resume_to_cmd(tmp_path: Path) -> None:
@@ -1552,6 +1570,7 @@ def _make_session(
     thread_ts: str = "ts-root",
     session_id: str = "uuid-resume",
     state: str = "idle",
+    inbox_path: str = "",
 ) -> SessionRecord:
     date_str, num_str = ref.split("/", 1)
     return SessionRecord(
@@ -1563,6 +1582,7 @@ def _make_session(
         thread_ts=thread_ts,
         created_at=datetime(2026, 4, 5, tzinfo=timezone.utc),
         state=state,
+        inbox_path=inbox_path,
     )
 
 
@@ -1881,3 +1901,821 @@ async def test_try_route_event_dm_hash_prefix_recovers_from_log(tmp_path: Path) 
     mock_spawn.assert_called_once()
     assert mock_spawn.call_args.kwargs["resume_session_id"] == "recovered-uuid"
     assert mock_spawn.call_args.args[1] == "fix the edge case"
+
+
+# ---------------------------------------------------------------------------
+# _try_route_event — threading matrix: top-level vs existing thread (inbox routing)
+# ---------------------------------------------------------------------------
+
+
+async def test_top_level_message_new_thread_spawns_new() -> None:
+    """A top-level slack message (no existing session) spawns a new agent, no inbox write."""
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {"channel": "C001", "ts": "ts-top", "user": "U001", "text": "<@U_SELF> start a task"}
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            is_app_mention=True,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    mock_ct.assert_called_once()  # spawned a new agent
+    slack_client.reactions_add.assert_not_called()  # no queue-ack reaction
+
+
+async def test_thread_reply_running_session_enqueues_not_spawn(tmp_path: Path) -> None:
+    """A reply to a thread whose agent is still running is queued to the inbox, not forked."""
+    inbox = str(tmp_path / "inbox.jsonl")
+    session_ref = "2026-04-05/1"
+    rec = _make_session(session_ref, state="running", inbox_path=inbox)
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    session_counter: dict[str, int] = {}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {
+        "channel": "C001",
+        "ts": "ts-reply",
+        "thread_ts": "ts-root",
+        "user": "U001",
+        "text": "<@U_SELF> also handle edge cases",
+    }
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    mock_ct.assert_not_called()  # NOT spawned — queued instead
+    slack_client.reactions_add.assert_called_once()
+    assert slack_client.reactions_add.call_args.kwargs["name"] == "eyes"
+    assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "ts-reply"
+    queued = _inbox_messages(inbox)
+    assert len(queued) == 1
+    # mention is stripped before queueing
+    assert queued[0]["text"] == "also handle edge cases"
+    assert queued[0]["user"] == "U001"
+
+
+async def test_thread_reply_draining_session_enqueues(tmp_path: Path) -> None:
+    """A 'draining' session is treated as busy — replies are queued, not forked."""
+    inbox = str(tmp_path / "inbox.jsonl")
+    session_ref = "2026-04-05/1"
+    rec = _make_session(session_ref, state="draining", inbox_path=inbox)
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {
+        "channel": "C001",
+        "ts": "ts-reply2",
+        "thread_ts": "ts-root",
+        "user": "U002",
+        "text": "<@U_SELF> one more thing",
+    }
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter={},
+        )
+
+    mock_ct.assert_not_called()
+    assert len(_inbox_messages(inbox)) == 1
+    # The queued message is acked with a reaction on the triggering message.
+    slack_client.reactions_add.assert_called_once()
+    assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "ts-reply2"
+
+
+async def test_thread_reply_idle_session_resumes_not_enqueues(tmp_path: Path) -> None:
+    """An idle session uses the existing --resume path and does NOT write to the inbox."""
+    inbox = str(tmp_path / "inbox.jsonl")
+    session_ref = "2026-04-05/1"
+    rec = _make_session(session_ref, state="idle", inbox_path=inbox)
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {
+        "channel": "C001",
+        "ts": "ts-reply",
+        "thread_ts": "ts-root",
+        "user": "U001",
+        "text": "<@U_SELF> continue please",
+    }
+
+    with patch("router.router.spawn_engineer", new_callable=AsyncMock) as mock_spawn:
+        with patch("router.router.asyncio.create_task", side_effect=_mock_create_task):
+            await _try_route_event(
+                event,
+                event,
+                channel_map,
+                "B_SELF",
+                "U_SELF",
+                slack_client,
+                semaphore,
+                tasks,
+                seen_ts,
+                {},
+                sessions=sessions,
+                session_by_thread=session_by_thread,
+                session_counter={},
+            )
+
+    mock_spawn.assert_called_once()
+    assert mock_spawn.call_args.kwargs["resume_session_id"] == "uuid-resume"
+    assert _inbox_messages(inbox) == []  # idle path never queues
+
+
+async def test_new_top_level_while_other_thread_running_spawns(tmp_path: Path) -> None:
+    """A new top-level message spawns even when a DIFFERENT thread's agent is running."""
+    inbox = str(tmp_path / "inbox.jsonl")
+    busy_ref = "2026-04-05/1"
+    busy = _make_session(busy_ref, state="running", thread_ts="ts-other", inbox_path=inbox)
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions = {busy_ref: busy}
+    session_by_thread = {"C001:ts-other": busy_ref}  # the busy thread is a different root
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    # A brand-new top-level message → its own thread_ts == its ts, no session there.
+    event = {"channel": "C001", "ts": "ts-new", "user": "U001", "text": "<@U_SELF> separate task"}
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            is_app_mention=True,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter={},
+        )
+
+    mock_ct.assert_called_once()  # spawned, not queued onto the other thread
+    assert _inbox_messages(inbox) == []
+
+
+async def test_dm_hash_ref_running_session_enqueues(tmp_path: Path) -> None:
+    """A DM '#ref <msg>' targeting a running named session is queued (text stripped)."""
+    inbox = str(tmp_path / "inbox.jsonl")
+    session_ref = "2026-04-05/1"
+    rec = _make_session(
+        session_ref, state="running", channel_id="C001", thread_ts="ts-root", inbox_path=inbox
+    )
+    dm_project = make_project(name="proj", platform="slack")
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {
+        "channel": "D001",
+        "channel_type": "im",
+        "ts": "ts-dm",
+        "user": "U001",
+        "text": "#2026-04-05/1 add logging too",
+    }
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            {},
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            is_app_mention=True,
+            channel_type="im",
+            project_override=dm_project,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter={},
+        )
+
+    mock_ct.assert_not_called()
+    queued = _inbox_messages(inbox)
+    assert len(queued) == 1
+    assert queued[0]["text"] == "add logging too"  # #ref prefix stripped
+
+
+# ---------------------------------------------------------------------------
+# spawn_engineer — exit-time resume-drain
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_engineer_drains_inbox_on_exit_resumes(tmp_path: Path) -> None:
+    """A message queued during the run is drained afterward via a same-session resume."""
+    project = make_project(workspace=str(tmp_path), agent_name="engineer", follow_thread=True)
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+
+    cmds: list[list[str]] = []
+    outs = [
+        _stream_json_with_session("first answer", "uuid-1"),
+        _stream_json_with_session("second answer", "uuid-2"),
+    ]
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        cmds.append([str(a) for a in args])
+        if len(cmds) == 1:
+            # While the first run is "in flight", a follow-up is queued into its inbox.
+            rec = next(iter(sessions.values()))
+            _append_to_inbox(rec.inbox_path, "U001", "follow up", "ts-2")
+        else:
+            # The drain run must reuse the SAME record (no new daily number) and be running.
+            assert len(sessions) == 1
+            assert next(iter(sessions.values())).state == "running"
+        data = outs.pop(0) if outs else b""
+        return _make_proc(data, returncode=0)
+
+    with patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await spawn_engineer(
+            project,
+            "initial task",
+            "C001",
+            "ts-root",
+            slack_client := AsyncMock(),
+            semaphore,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    assert len(cmds) == 2  # initial run + one drain run
+    assert "uuid-1" in cmds[1]  # drain resumed the just-finished session
+    assert len(sessions) == 1  # same record reused, no new session minted
+    rec = next(iter(sessions.values()))
+    assert rec.state == "idle"  # drained to completion
+    assert rec.claude_session_id == "uuid-2"
+    assert _inbox_messages(rec.inbox_path) == []  # inbox emptied
+    # both answers reached the thread (one per turn)
+    posts = [c.kwargs.get("text", "") for c in slack_client.chat_postMessage.call_args_list]
+    assert "first answer" in posts
+    assert "second answer" in posts
+
+
+async def test_spawn_engineer_drains_inbox_fresh_prompt_when_no_session_id(tmp_path: Path) -> None:
+    """If the run crashed without a session id, the queued message drains as a fresh prompt."""
+    project = make_project(workspace=str(tmp_path), agent_name="engineer", follow_thread=True)
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+
+    cmds: list[list[str]] = []
+    # First run: failure, no session_id. Second (drain) run: success.
+    outs = [b"", _stream_json_with_session("recovered", "uuid-2")]
+    rcs = [1, 0]
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        cmds.append([str(a) for a in args])
+        if len(cmds) == 1:
+            rec = next(iter(sessions.values()))
+            _append_to_inbox(rec.inbox_path, "U001", "retry please", "ts-2")
+        data = outs.pop(0) if outs else b""
+        return _make_proc(data, returncode=rcs.pop(0) if rcs else 0)
+
+    with patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await spawn_engineer(
+            project,
+            "initial task",
+            "C001",
+            "ts-root",
+            AsyncMock(),
+            semaphore,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    assert len(cmds) == 2
+    # No session id survived the crash → drain runs as a fresh prompt (no resume arg appended).
+    # cmds[1] is the bash+runner+positional args with NO trailing session id.
+    assert cmds[1][-1] != "uuid-1"
+    rec = next(iter(sessions.values()))
+    assert rec.state == "idle"
+    assert _inbox_messages(rec.inbox_path) == []
+
+
+async def test_spawn_engineer_no_drain_when_inbox_empty(tmp_path: Path) -> None:
+    """With an empty inbox the record ends idle and no second run is scheduled."""
+    project = make_project(workspace=str(tmp_path), agent_name="engineer", follow_thread=True)
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+
+    cmds: list[list[str]] = []
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        cmds.append([str(a) for a in args])
+        return _make_proc(_stream_json_with_session("done", "uuid-1"), returncode=0)
+
+    with patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await spawn_engineer(
+            project,
+            "task",
+            "C001",
+            "ts-root",
+            AsyncMock(),
+            semaphore,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    assert len(cmds) == 1  # no drain run
+    assert next(iter(sessions.values())).state == "idle"
+
+
+async def test_spawn_engineer_no_inbox_path_when_follow_thread_off(tmp_path: Path) -> None:
+    """A default (follow_thread off) agent provisions no inbox and sets no ORCAI_INBOX env."""
+    project = make_project(workspace=str(tmp_path), agent_name="engineer")  # follow_thread=False
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+
+    cmds: list[list[str]] = []
+    envs: list[Any] = []
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        cmds.append([str(a) for a in args])
+        envs.append(kwargs.get("env"))
+        return _make_proc(_stream_json_with_session("done", "uuid-1"), returncode=0)
+
+    with patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await spawn_engineer(
+            project,
+            "task",
+            "C001",
+            "ts-root",
+            AsyncMock(),
+            semaphore,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    rec = next(iter(sessions.values()))
+    assert rec.inbox_path == ""  # no inbox provisioned
+    # env is always set now (it carries the Slack coordinates); ORCAI_INBOX must be absent.
+    assert envs[0] is not None
+    assert "ORCAI_INBOX" not in envs[0]
+    assert len(cmds) == 1  # no drain
+    assert rec.state == "idle"
+
+
+def test_load_projects_parses_follow_thread(tmp_path: Path) -> None:
+    workspace = tmp_path / "proj"
+    write_multi_agent_config(
+        workspace,
+        agents=[
+            {
+                "name": "qplus-manager",
+                "platform": "slack",
+                "follow_thread": True,
+                "slack": {
+                    "channels": ["#qplus"],
+                    "bot_token_env": "M_BOT",
+                    "app_token_env": "M_APP",
+                },
+            },
+            {
+                "name": "engineer",
+                "slack": {
+                    "channels": ["#eng"],
+                    "bot_token_env": "E_BOT",
+                    "app_token_env": "E_APP",
+                },
+            },
+        ],
+    )
+    (workspace / ".env").write_text("M_BOT=x\nM_APP=y\nE_BOT=x\nE_APP=y\n")
+    cfg = write_router_config(tmp_path, [str(workspace)])
+
+    projects = load_projects(cfg)
+
+    mgr = next(p for p in projects if p.agent_name == "qplus-manager")
+    eng = next(p for p in projects if p.agent_name == "engineer")
+    assert mgr.follow_thread is True
+    assert eng.follow_thread is False  # default off
+
+
+# ---------------------------------------------------------------------------
+# _add_reaction
+# ---------------------------------------------------------------------------
+
+
+async def test_add_reaction_calls_api_on_success() -> None:
+    client = AsyncMock()
+    await _add_reaction(client, "C001", "trig.1", "eyes")
+    client.reactions_add.assert_called_once_with(channel="C001", name="eyes", timestamp="trig.1")
+
+
+async def test_add_reaction_noop_when_ts_empty() -> None:
+    client = AsyncMock()
+    await _add_reaction(client, "C001", "", "eyes")
+    client.reactions_add.assert_not_called()
+
+
+async def test_add_reaction_logs_warning_on_failure(caplog: pytest.LogCaptureFixture) -> None:
+    # Regression guard: a missing reactions:write scope must surface at WARNING, not be
+    # swallowed at DEBUG (the original silent-failure bug), and must not raise.
+    client = AsyncMock()
+    client.reactions_add.side_effect = Exception("missing_scope")
+    with caplog.at_level(logging.WARNING, logger="router"):
+        await _add_reaction(client, "C001", "trig.1", "eyes")
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Failed to add reaction" in r.getMessage() for r in warnings)
+
+
+# ---------------------------------------------------------------------------
+# spawn_engineer — outbox env + relay (all proactive Slack via the bot token)
+# ---------------------------------------------------------------------------
+
+
+_EXEC = "router.router.asyncio.create_subprocess_exec"
+
+
+def _exec_capture(
+    captured: dict[str, Any], proc: Any, outbox_lines: list[dict[str, Any]] | None = None
+) -> Any:
+    """create_subprocess_exec stub: record env, and (optionally) write outbox lines mid-run so
+    the router's drain loop relays them."""
+
+    async def fake_exec(*args: object, **kwargs: object) -> Any:
+        env = cast("dict[str, str]", kwargs.get("env") or {})
+        captured["env"] = env
+        captured["outbox"] = env.get("ORCAI_OUTBOX", "")
+        if captured["outbox"] and outbox_lines:
+            os.makedirs(os.path.dirname(captured["outbox"]), exist_ok=True)
+            with open(captured["outbox"], "a", encoding="utf-8") as f:
+                for m in outbox_lines:
+                    f.write(json.dumps(m) + "\n")
+        return proc
+
+    return fake_exec
+
+
+class _LiveProc:
+    """Process stub whose returncode stays None for `alive_polls` reads, then 0 — so the outbox
+    drain loop iterates a few times before the agent 'exits'."""
+
+    def __init__(self, stdout_bytes: bytes, alive_polls: int) -> None:
+        self.stdout = _async_lines(stdout_bytes)
+        self.kill = MagicMock()
+        self._reads = 0
+        self._alive = alive_polls
+
+    @property
+    def returncode(self) -> int | None:
+        self._reads += 1
+        return None if self._reads <= self._alive else 0
+
+    async def wait(self) -> int:
+        return 0
+
+
+async def test_spawn_exports_outbox_env(tmp_path: Path) -> None:
+    proc = _make_proc(_stream_json("done"), returncode=0)
+    project = make_project(workspace=str(tmp_path), follow_thread=True)
+    semaphore = asyncio.Semaphore(1)
+    sessions: dict[str, SessionRecord] = {}
+    captured: dict[str, Any] = {}
+
+    with patch(_EXEC, side_effect=_exec_capture(captured, proc)):
+        await spawn_engineer(
+            project, "msg", "C001", "ts-root", AsyncMock(), semaphore,
+            sessions=sessions, session_by_thread={}, session_counter={},
+        )
+
+    ref = next(iter(sessions))
+    assert captured["env"]["ORCAI_OUTBOX"] == _outbox_path_for(str(tmp_path), ref)
+    # ORCAI_SAY is an absolute path to the helper so the skill never needs $CLAUDE_PROJECT_DIR.
+    assert captured["env"]["ORCAI_SAY"] == os.path.join(
+        str(tmp_path), ".orcai", "hooks", "outbox_say.py"
+    )
+    assert "ORCAI_INBOX" in captured["env"]  # follow_thread on → inbox also provisioned
+
+
+async def test_no_outbox_env_when_untracked(tmp_path: Path) -> None:
+    # No session tracking → no stable session ref → no outbox.
+    proc = _make_proc(_stream_json("done"), returncode=0)
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+    captured: dict[str, Any] = {}
+
+    with patch(_EXEC, side_effect=_exec_capture(captured, proc)):
+        await spawn_engineer(project, "msg", "C001", "ts-root", AsyncMock(), semaphore)
+
+    assert "ORCAI_OUTBOX" not in captured["env"]
+
+
+async def test_outbox_progress_posted_to_thread(tmp_path: Path) -> None:
+    proc = _make_proc(_stream_json("final"), returncode=0)
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+    slack = AsyncMock()
+    captured: dict[str, Any] = {}
+    lines = [{"text": "1/3 working", "dm": False}]
+
+    with patch(_EXEC, side_effect=_exec_capture(captured, proc, lines)):
+        await spawn_engineer(
+            project, "msg", "C001", "ts-root", slack, semaphore, trigger_user="U777",
+            sessions={}, session_by_thread={}, session_counter={},
+        )
+
+    progress = [
+        c for c in slack.chat_postMessage.call_args_list if c.kwargs.get("text") == "1/3 working"
+    ]
+    assert len(progress) == 1
+    assert progress[0].kwargs["channel"] == "C001"
+    assert progress[0].kwargs["thread_ts"] == "ts-root"
+
+
+async def test_outbox_dm_posted_to_user(tmp_path: Path) -> None:
+    proc = _make_proc(_stream_json("final"), returncode=0)
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+    slack = AsyncMock()
+    captured: dict[str, Any] = {}
+    lines = [{"text": "blocked, need input", "dm": True}]
+
+    with patch(_EXEC, side_effect=_exec_capture(captured, proc, lines)):
+        await spawn_engineer(
+            project, "msg", "C001", "ts-root", slack, semaphore, trigger_user="U777",
+            sessions={}, session_by_thread={}, session_counter={},
+        )
+
+    dm = [
+        c for c in slack.chat_postMessage.call_args_list
+        if c.kwargs.get("text") == "blocked, need input"
+    ]
+    assert len(dm) == 1
+    assert dm[0].kwargs["channel"] == "U777"  # escalation DM to the triggering user
+    assert "thread_ts" not in dm[0].kwargs
+
+
+async def test_outbox_mentions_resolved_and_truncated(tmp_path: Path) -> None:
+    proc = _make_proc(_stream_json("final"), returncode=0)
+    project = make_project(workspace=str(tmp_path), mentions={"reviewer": "U999"})
+    semaphore = asyncio.Semaphore(1)
+    slack = AsyncMock()
+    captured: dict[str, Any] = {}
+    lines = [{"text": "@reviewer " + "x" * 5000, "dm": False}]
+
+    with patch(_EXEC, side_effect=_exec_capture(captured, proc, lines)):
+        await spawn_engineer(
+            project, "msg", "C001", "ts-root", slack, semaphore,
+            sessions={}, session_by_thread={}, session_counter={},
+        )
+
+    posted = [
+        c.kwargs["text"]
+        for c in slack.chat_postMessage.call_args_list
+        if "<@U999>" in c.kwargs.get("text", "")
+    ]
+    assert posted
+    assert posted[0].endswith("... (truncated)")
+    assert len(posted[0]) <= SLACK_MAX_LENGTH + len("\n... (truncated)")
+
+
+async def test_outbox_no_duplicate_posts(tmp_path: Path) -> None:
+    # A proc that stays alive for several poll cycles → the drain loop iterates; the line must
+    # still be posted exactly once (offset tracking).
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+    slack = AsyncMock()
+    proc = _LiveProc(_stream_json("final"), alive_polls=3)
+    captured: dict[str, Any] = {}
+    lines = [{"text": "once only", "dm": False}]
+
+    with patch(_EXEC, side_effect=_exec_capture(captured, proc, lines)):
+        with patch("router.router.asyncio.sleep", new_callable=AsyncMock):
+            await spawn_engineer(
+                project, "m", "C001", "ts-root", slack, semaphore,
+                sessions={}, session_by_thread={}, session_counter={},
+            )
+
+    once = [c for c in slack.chat_postMessage.call_args_list if c.kwargs.get("text") == "once only"]
+    assert len(once) == 1
+
+
+async def test_outbox_post_error_does_not_kill_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    proc = _make_proc(_stream_json("final"), returncode=0)
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+    slack = AsyncMock()
+    slack.chat_postMessage.side_effect = Exception("slack down")
+    captured: dict[str, Any] = {}
+    lines = [{"text": "progress", "dm": False}]
+
+    with caplog.at_level(logging.WARNING, logger="router"):
+        with patch(_EXEC, side_effect=_exec_capture(captured, proc, lines)):
+            await spawn_engineer(  # must not raise despite the post failure
+                project, "msg", "C001", "ts-root", slack, semaphore,
+                sessions={}, session_by_thread={}, session_counter={},
+            )
+
+    assert any("Failed to relay outbox message" in r.getMessage() for r in caplog.records)
+
+
+async def test_outbox_cleared_on_exit(tmp_path: Path) -> None:
+    proc = _make_proc(_stream_json("final"), returncode=0)
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+    captured: dict[str, Any] = {}
+    lines = [{"text": "hi", "dm": False}]
+
+    with patch(_EXEC, side_effect=_exec_capture(captured, proc, lines)):
+        await spawn_engineer(
+            project, "msg", "C001", "ts-root", AsyncMock(), semaphore,
+            sessions={}, session_by_thread={}, session_counter={},
+        )
+
+    assert captured["outbox"]
+    assert not os.path.exists(captured["outbox"])  # removed after the run
+
+
+# ---------------------------------------------------------------------------
+# _try_route_event — triggering user threaded to spawn
+# ---------------------------------------------------------------------------
+
+
+async def test_route_event_passes_trigger_user_to_spawn() -> None:
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    semaphore = asyncio.Semaphore(3)
+    event = {"channel": "C001", "ts": "t1", "user": "U123", "text": "<@U_SELF> do work"}
+
+    with patch("router.router.spawn_engineer", new_callable=AsyncMock) as mock_spawn:
+        with patch("router.router.asyncio.create_task", side_effect=_mock_create_task):
+            await _try_route_event(
+                event, event, channel_map, "B_SELF", "U_SELF",
+                AsyncMock(), semaphore, tasks, seen_ts, {},
+            )
+
+    mock_spawn.assert_called_once()
+    assert mock_spawn.call_args.kwargs["trigger_user"] == "U123"
+
+
+async def test_route_event_trigger_user_falls_back_to_username() -> None:
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    semaphore = asyncio.Semaphore(3)
+    # No "user" key (e.g. an integration post) → fall back to "username".
+    event = {"channel": "C001", "ts": "t2", "username": "integration-bot", "text": "<@U_SELF> ping"}
+
+    with patch("router.router.spawn_engineer", new_callable=AsyncMock) as mock_spawn:
+        with patch("router.router.asyncio.create_task", side_effect=_mock_create_task):
+            await _try_route_event(
+                event, event, channel_map, "B_SELF", "U_SELF",
+                AsyncMock(), semaphore, tasks, seen_ts, {},
+            )
+
+    mock_spawn.assert_called_once()
+    assert mock_spawn.call_args.kwargs["trigger_user"] == "integration-bot"
+
+
+# ---------------------------------------------------------------------------
+# spawn_engineer — drain continuation keeps its outbox
+# ---------------------------------------------------------------------------
+
+
+async def test_drain_continuation_provisions_outbox(tmp_path: Path) -> None:
+    project = make_project(workspace=str(tmp_path), agent_name="engineer", follow_thread=True)
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+    cmds: list[list[str]] = []
+    envs: list[Any] = []
+    outs = [
+        _stream_json_with_session("first", "uuid-1"),
+        _stream_json_with_session("second", "uuid-2"),
+    ]
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        cmds.append([str(a) for a in args])
+        envs.append(kwargs.get("env"))
+        if len(cmds) == 1:
+            rec = next(iter(sessions.values()))
+            _append_to_inbox(rec.inbox_path, "U001", "follow up", "ts-2")
+        return _make_proc(outs.pop(0) if outs else b"", returncode=0)
+
+    with patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await spawn_engineer(
+            project,
+            "initial",
+            "C001",
+            "ts-root",
+            AsyncMock(),
+            semaphore,
+            trigger_user="U777",
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    assert len(cmds) == 2  # initial + drain
+    # The drain continuation reuses the same session, so it keeps the same outbox + inbox.
+    assert envs[1]["ORCAI_OUTBOX"] == envs[0]["ORCAI_OUTBOX"]
+    assert "ORCAI_INBOX" in envs[1]
+
+
+async def test_final_result_still_posted_once(tmp_path: Path) -> None:
+    # Agent-side proactive posting is additive: the router still posts the final result once.
+    proc = _make_proc(_stream_json("the answer"), returncode=0)
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+    slack_client = AsyncMock()
+
+    with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
+        await spawn_engineer(
+            project, "q", "C001", "ts-root", slack_client, semaphore, trigger_user="U1"
+        )
+
+    posts = [
+        c for c in slack_client.chat_postMessage.call_args_list
+        if c.kwargs.get("text") == "the answer"
+    ]
+    assert len(posts) == 1
+    assert posts[0].kwargs["thread_ts"] == "ts-root"

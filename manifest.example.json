@@ -15,6 +15,7 @@
                 "app_mentions:read",
                 "channels:history",
                 "chat:write",
+                "reactions:write",
                 "groups:history",
                 "im:history",
                 "mpim:history",
