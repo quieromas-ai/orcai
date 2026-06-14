@@ -780,9 +780,17 @@ async def spawn_engineer(
                 except Exception as e:
                     logger.error("Failed to post Slack response: %s", e)
 
-            # Only show the "session saved — reply to continue" banner once the conversation
-            # truly goes idle (not between queued messages mid-drain).
-            if exit_code == 0 and session_ref and claude_session_id and not drain_batch:
+            # Show the "session saved — reply/DM to continue" banner only ONCE, when the session
+            # is first created — not on every resume/thread-reply (that floods the thread). A
+            # resume always carries resume_session_id; a fresh session does not. Also skipped
+            # mid-drain (not drain_batch).
+            if (
+                exit_code == 0
+                and session_ref
+                and claude_session_id
+                and not drain_batch
+                and resume_session_id is None
+            ):
                 banner_kwargs: dict[str, Any] = {
                     "channel": channel_id,
                     "text": (

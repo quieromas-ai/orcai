@@ -1506,6 +1506,27 @@ async def test_spawn_engineer_posts_banner_on_success(tmp_path: Path) -> None:
     assert "reply here" in banner_text
 
 
+async def test_spawn_engineer_no_banner_on_resume(tmp_path: Path) -> None:
+    # A resume (thread reply / DM #ref) carries resume_session_id → the "session saved" banner
+    # must NOT be re-posted on every turn (it floods the thread); it shows once at creation only.
+    stdout = _stream_json_with_session("continued", "uuid-99")
+    proc = _make_proc(stdout, returncode=0)
+    slack_client = AsyncMock()
+    project = make_project(workspace=str(tmp_path))
+    semaphore = asyncio.Semaphore(1)
+
+    with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
+        await spawn_engineer(
+            project, "more", "C001", "ts1", slack_client, semaphore,
+            resume_session_id="uuid-old",
+            sessions={}, session_by_thread={}, session_counter={},
+        )
+
+    texts = [c.kwargs.get("text", "") for c in slack_client.chat_postMessage.call_args_list]
+    assert not any("saved" in t for t in texts)  # no banner on resume
+    assert slack_client.chat_postMessage.call_count == 1  # just the streamed result
+
+
 async def test_spawn_engineer_no_banner_on_failure(tmp_path: Path) -> None:
     proc = _make_proc(b"", returncode=1)
     slack_client = AsyncMock()
