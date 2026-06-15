@@ -815,12 +815,16 @@ async def spawn_engineer(
         # survived a crash. Recurses until the inbox is empty and the record goes idle.
         if drain_batch and drain_ref is not None:
             newest = drain_batch[-1]
+            # Combine every queued message (in arrival order) into one resumed turn, so a burst
+            # of replies is answered together rather than collapsing to just the latest. The
+            # newest message's ts anchors the reaction/thread-context exclusion.
+            combined_text = "\n".join(m.get("text", "") for m in drain_batch if m.get("text"))
             logger.info(
                 "Draining %d queued message(s) for session #%s", len(drain_batch), drain_ref
             )
             await spawn_engineer(
                 project,
-                newest.get("text", ""),
+                combined_text,
                 channel_id,
                 thread_ts,
                 slack_client,

@@ -2555,6 +2555,41 @@ async def test_flag_false_drain_resumes_same_session(tmp_path: Path) -> None:
     assert "first answer" in posts and "second answer" in posts
 
 
+async def test_drain_combines_multiple_queued_messages(tmp_path: Path) -> None:
+    """Multiple messages queued during one run are drained together as a single combined turn —
+    none are dropped (regression for the 'newest-only' collapse seen with rapid bursts)."""
+    project = make_project(workspace=str(tmp_path), agent_name="engineer")
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+
+    cmds: list[list[str]] = []
+    outs = [
+        _stream_json_with_session("first", "uuid-1"),
+        _stream_json_with_session("combined", "uuid-2"),
+    ]
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        cmds.append([str(a) for a in args])
+        if len(cmds) == 1:
+            rec = next(iter(sessions.values()))
+            _append_to_inbox(rec.inbox_path, "U001", "what is 3+5?", "ts-2")
+            _append_to_inbox(rec.inbox_path, "U001", "what is 3+6?", "ts-3")
+        data = outs.pop(0) if outs else b""
+        return _make_proc(data, returncode=0)
+
+    with patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await spawn_engineer(
+            project, "initial", "C001", "ts-root", AsyncMock(), semaphore,
+            sessions=sessions, session_by_thread={}, session_counter={},
+        )
+
+    assert len(cmds) == 2  # both queued messages handled in ONE drain run, not collapsed/forked
+    drain_args = " ".join(cmds[1])
+    assert "what is 3+5?" in drain_args  # earlier message NOT dropped
+    assert "what is 3+6?" in drain_args  # later message present too
+    assert _inbox_messages(next(iter(sessions.values())).inbox_path) == []
+
+
 async def test_spawn_engineer_drains_inbox_fresh_prompt_when_no_session_id(tmp_path: Path) -> None:
     """If the run crashed without a session id, the queued message drains as a fresh prompt."""
     project = make_project(workspace=str(tmp_path), agent_name="engineer", follow_thread=True)
