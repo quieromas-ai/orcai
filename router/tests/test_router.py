@@ -321,7 +321,10 @@ async def test_spawn_engineer_resolves_mentions_in_result(tmp_path: Path) -> Non
     assert result_kwargs["text"] == "PR opened, <@U999> please check"
 
 
-async def test_spawn_engineer_adds_reaction_to_triggering_message(tmp_path: Path) -> None:
+async def test_spawn_engineer_does_not_self_ack(tmp_path: Path) -> None:
+    # The pickup reaction is emitted by the routing layer (_try_route_event), NOT by
+    # spawn_engineer. spawn_engineer must not react on its own, otherwise a routed message
+    # would be acked twice (and the drain re-spawn would re-ack an already-acked message).
     stdout = _stream_json("done")
     proc = _make_proc(stdout, returncode=0)
     slack_client = AsyncMock()
@@ -333,12 +336,7 @@ async def test_spawn_engineer_adds_reaction_to_triggering_message(tmp_path: Path
             project, "do something", "C001", "99.0", slack_client, semaphore, event_ts="trig.1"
         )
 
-    # Pickup is acked with a reaction on the triggering message, not a text post.
-    slack_client.reactions_add.assert_called_once()
-    rk = slack_client.reactions_add.call_args.kwargs
-    assert rk["channel"] == "C001"
-    assert rk["name"] == "eyes"
-    assert rk["timestamp"] == "trig.1"
+    slack_client.reactions_add.assert_not_called()
     posts = [c.kwargs.get("text", "") for c in slack_client.chat_postMessage.call_args_list]
     assert all("Picked up" not in t for t in posts)
 
@@ -399,31 +397,6 @@ async def test_spawn_engineer_no_banner_or_pickup_without_tracking(tmp_path: Pat
     # Without session tracking: only the streamed result, no pickup text, no session banner.
     posts = [c.kwargs.get("text", "") for c in slack_client.chat_postMessage.call_args_list]
     assert posts == ["done"]
-
-
-async def test_spawn_engineer_reaction_added_before_result(tmp_path: Path) -> None:
-    stdout = _stream_json("result text")
-    proc = _make_proc(stdout, returncode=0)
-    slack_client = AsyncMock()
-    call_order: list[str] = []
-
-    async def record_react(**kwargs: object) -> None:
-        call_order.append("react")
-
-    async def record_post(**kwargs: object) -> None:
-        call_order.append("post:" + str(kwargs.get("text", "")))
-
-    slack_client.reactions_add.side_effect = record_react
-    slack_client.chat_postMessage.side_effect = record_post
-    project = make_project(workspace=str(tmp_path), agent_name="engineer")
-    semaphore = asyncio.Semaphore(1)
-
-    with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
-        await spawn_engineer(
-            project, "do something", "C001", "ts1", slack_client, semaphore, event_ts="trig.1"
-        )
-
-    assert call_order == ["react", "post:result text"]
 
 
 async def test_spawn_engineer_log_written_to_workspace(tmp_path: Path) -> None:
@@ -1961,7 +1934,11 @@ async def test_top_level_message_new_thread_spawns_new() -> None:
         )
 
     mock_ct.assert_called_once()  # spawned a new agent
-    slack_client.reactions_add.assert_not_called()  # no queue-ack reaction
+    # Pickup is acked at the routing layer for every spawned message (not just the
+    # follow_thread queue path), on the triggering message's ts.
+    slack_client.reactions_add.assert_called_once()
+    assert slack_client.reactions_add.call_args.kwargs["name"] == "eyes"
+    assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "ts-top"
 
 
 async def test_thread_reply_running_session_enqueues_not_spawn(tmp_path: Path) -> None:
@@ -2101,6 +2078,206 @@ async def test_thread_reply_idle_session_resumes_not_enqueues(tmp_path: Path) ->
     mock_spawn.assert_called_once()
     assert mock_spawn.call_args.kwargs["resume_session_id"] == "uuid-resume"
     assert _inbox_messages(inbox) == []  # idle path never queues
+
+
+async def test_running_session_without_follow_thread_acks_and_spawns(tmp_path: Path) -> None:
+    """Regression: a thread reply to a running agent that has follow_thread OFF (no inbox)
+    is NOT queued — it re-spawns — and must still be acked with a reaction at the routing
+    layer. Previously the only routing-layer ack was the follow_thread (inbox) busy path,
+    so flag-off agents never got the 👀 on follow-ups (and a flag-on agent's came from the
+    pre-semaphore queue ack), making the reaction appear "only when the flag is true"."""
+    session_ref = "2026-04-05/1"
+    # inbox_path="" == follow_thread disabled — the busy/queue branch is skipped.
+    rec = _make_session(session_ref, state="running", inbox_path="")
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {
+        "channel": "C001",
+        "ts": "ts-reply",
+        "thread_ts": "ts-root",
+        "user": "U001",
+        "text": "<@U_SELF> any update?",
+    }
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter={},
+        )
+
+    mock_ct.assert_called_once()  # re-spawned (not queued — no inbox)
+    slack_client.reactions_add.assert_called_once()
+    assert slack_client.reactions_add.call_args.kwargs["name"] == "eyes"
+    assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "ts-reply"
+
+
+async def test_idle_thread_reply_resume_acks_reaction(tmp_path: Path) -> None:
+    """The idle-session --resume path also acks at the routing layer (it flows through the
+    same create_task site, not the follow_thread queue branch)."""
+    session_ref = "2026-04-05/1"
+    rec = _make_session(session_ref, state="idle", inbox_path="")
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {
+        "channel": "C001",
+        "ts": "ts-reply",
+        "thread_ts": "ts-root",
+        "user": "U001",
+        "text": "<@U_SELF> continue please",
+    }
+
+    with patch("router.router.spawn_engineer", new_callable=AsyncMock) as mock_spawn:
+        with patch("router.router.asyncio.create_task", side_effect=_mock_create_task):
+            await _try_route_event(
+                event,
+                event,
+                channel_map,
+                "B_SELF",
+                "U_SELF",
+                slack_client,
+                semaphore,
+                tasks,
+                seen_ts,
+                {},
+                sessions=sessions,
+                session_by_thread=session_by_thread,
+                session_counter={},
+            )
+
+    mock_spawn.assert_called_once()
+    assert mock_spawn.call_args.kwargs["resume_session_id"] == "uuid-resume"
+    slack_client.reactions_add.assert_called_once()
+    assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "ts-reply"
+
+
+async def test_dm_message_acks_reaction() -> None:
+    """A DM routed via project_override is acked on its triggering ts."""
+    dm_project = make_project(name="dm-proj", platform="slack")
+    channel_map: dict[str, ProjectConfig] = {}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    dm_event = {
+        "channel": "D001",
+        "channel_type": "im",
+        "ts": "1700000000.000001",
+        "user": "U001",
+        "text": "Can you help me?",
+    }
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            dm_event,
+            dm_event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            is_app_mention=True,
+            channel_type="im",
+            project_override=dm_project,
+        )
+
+    mock_ct.assert_called_once()
+    slack_client.reactions_add.assert_called_once()
+    assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "1700000000.000001"
+
+
+async def test_ack_independent_of_concurrency() -> None:
+    """The ack is emitted by _try_route_event BEFORE the spawn task, so a fully-occupied
+    concurrency semaphore (e.g. a long-running agent holding every slot) cannot delay it."""
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()  # zero free slots — a spawn would block here
+
+    event = {"channel": "C001", "ts": "ts-top", "user": "U001", "text": "<@U_SELF> go"}
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            is_app_mention=True,
+            sessions={},
+            session_by_thread={},
+            session_counter={},
+        )
+
+    mock_ct.assert_called_once()  # spawn was scheduled (and would block on the semaphore)
+    slack_client.reactions_add.assert_called_once()  # but the ack already fired
+    assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "ts-top"
+
+
+async def test_dropped_event_does_not_ack() -> None:
+    """An event the router drops (not @mentioned, not a bot message) is never acked."""
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    # Plain channel message, no @mention of the bot → dropped before any spawn/ack.
+    event = {"channel": "C001", "ts": "ts-top", "user": "U001", "text": "just chatting"}
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            is_app_mention=False,
+            sessions={},
+            session_by_thread={},
+            session_counter={},
+        )
+
+    mock_ct.assert_not_called()
+    slack_client.reactions_add.assert_not_called()
 
 
 async def test_new_top_level_while_other_thread_running_spawns(tmp_path: Path) -> None:

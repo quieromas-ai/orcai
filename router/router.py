@@ -593,10 +593,6 @@ async def spawn_engineer(
             )
             log_path = os.path.join(log_dir, log_name)
 
-            # Acknowledge pickup with a reaction on the triggering message instead of a
-            # text post — keeps threads clean during long runs.
-            await _add_reaction(slack_client, channel_id, event_ts, "eyes")
-
             context = await fetch_thread_context(
                 slack_client, channel_id, thread_ts, event_ts, channel_type, user_cache or {}
             )
@@ -1025,6 +1021,12 @@ async def _try_route_event(
                     logger.info("No session found for #%s — treating as new message", target_ref)
 
     trigger_user = source.get("user", "") or source.get("username", "")
+    # Acknowledge pickup with a reaction on the triggering message (instead of a text post),
+    # here at the routing layer — BEFORE the spawn task and its concurrency semaphore — so it
+    # fires immediately for every routed message regardless of `follow_thread` or how many
+    # slots a long-running agent is holding. The busy/queue path above acks separately and
+    # returns, so a message is acked at exactly one of the two sites, never both.
+    await _add_reaction(slack_client, channel, msg_ts, "eyes")
     task = asyncio.create_task(
         spawn_engineer(
             project,
