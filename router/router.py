@@ -924,7 +924,17 @@ async def _try_route_event(
         is_bot_message = "bot_id" in source
         mention = f"<@{own_user_id}>"
         is_mentioned = mention in text
-        if not is_bot_message and not is_mentioned:
+        # Admit a plain in-thread reply (no @mention) when its thread already has a live session:
+        # natural thread conversations continue without re-tagging the bot on every message.
+        # Starting a NEW conversation still requires a mention, so unrelated channel chatter is
+        # ignored. (DMs already bypass this gate — the handler routes them as app_mentions.)
+        reply_thread_ts = event.get("thread_ts")
+        in_live_thread = (
+            bool(reply_thread_ts)
+            and session_by_thread is not None
+            and f"{channel}:{reply_thread_ts}" in session_by_thread
+        )
+        if not is_bot_message and not is_mentioned and not in_live_thread:
             logger.info("Dropped event in #%s: not a bot message and not @mentioned", channel)
             return
         if is_mentioned:

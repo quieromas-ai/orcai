@@ -2130,6 +2130,82 @@ async def test_running_session_without_follow_thread_enqueues_not_forks(tmp_path
     assert session_by_thread["C001:ts-root"] == session_ref
 
 
+async def test_unmentioned_reply_in_tracked_thread_is_routed(tmp_path: Path) -> None:
+    """A plain in-thread reply (no @mention) whose thread already has a live session is routed
+    to that session instead of being dropped by the mention gate — natural thread conversations
+    continue without re-tagging the bot on every message."""
+    inbox = str(tmp_path / "inbox.jsonl")
+    session_ref = "2026-04-05/1"
+    rec = _make_session(session_ref, state="running", inbox_path=inbox)
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    # No "<@U_SELF>" mention — just a thread reply (is_app_mention defaults False).
+    event = {"channel": "C001", "ts": "ts-r", "thread_ts": "ts-root", "text": "2+2?"}
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event, event, channel_map, "B_SELF", "U_SELF", slack_client, semaphore,
+            tasks, seen_ts, {},
+            sessions=sessions, session_by_thread=session_by_thread, session_counter={},
+        )
+
+    mock_ct.assert_not_called()  # queued onto the running session, not forked
+    queued = _inbox_messages(inbox)
+    assert len(queued) == 1 and queued[0]["text"] == "2+2?"
+    slack_client.reactions_add.assert_called_once()
+
+
+async def test_unmentioned_reply_in_untracked_thread_is_dropped() -> None:
+    """A plain reply (no @mention) in a thread with NO live session is still dropped — starting a
+    conversation still requires an @mention, so unrelated channel chatter is ignored."""
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}  # thread not tracked
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {"channel": "C001", "ts": "ts-r", "thread_ts": "ts-root", "text": "2+2?"}
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event, event, channel_map, "B_SELF", "U_SELF", slack_client, semaphore,
+            tasks, seen_ts, {},
+            sessions=sessions, session_by_thread=session_by_thread, session_counter={},
+        )
+
+    mock_ct.assert_not_called()
+    slack_client.reactions_add.assert_not_called()
+
+
+async def test_unmentioned_top_level_message_is_dropped() -> None:
+    """A top-level message (no thread, no @mention) is dropped — there is no session to continue."""
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {"channel": "C001", "ts": "ts-top", "user": "U001", "text": "random chatter"}
+
+    with patch("router.router.asyncio.create_task", side_effect=_mock_create_task) as mock_ct:
+        await _try_route_event(
+            event, event, channel_map, "B_SELF", "U_SELF", slack_client, semaphore,
+            tasks, seen_ts, {},
+            sessions={}, session_by_thread={}, session_counter={},
+        )
+
+    mock_ct.assert_not_called()
+    slack_client.reactions_add.assert_not_called()
+
+
 async def test_idle_thread_reply_resume_acks_reaction(tmp_path: Path) -> None:
     """The idle-session --resume path also acks at the routing layer (it flows through the
     same create_task site, not the follow_thread queue branch)."""

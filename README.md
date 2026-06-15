@@ -249,9 +249,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now router
 
 ## Message routing
 
-- **`@BotName <request>`** — strips the mention and forwards to the agent. Messages without a mention are ignored.
+- **`@BotName <request>`** — strips the mention and forwards to the agent. A mention is required to *start* a conversation; an un-mentioned top-level message is ignored.
 - **GitHub / Azure DevOps integration bots** — forwarded automatically; no mention needed. Subscribe channels to events with `/github subscribe owner/repo issues pulls reviews comments`.
-- **Thread replies (idle session)** — resume the previous Claude session, preserving full context.
+- **Thread replies (idle session)** — resume the previous Claude session, preserving full context. Once a thread has a live session, plain replies need **no** re-mention; chatter in untracked threads still requires one.
 - **Thread replies (busy session)** — queued onto the same session and resumed when the run finishes (or picked up mid-run with `follow_thread: true`) instead of forking a second agent (see below).
 - **Pickup ack** — the triggering message gets an 👀 reaction rather than a "picked up" text reply, keeping threads clean. Requires the bot's `reactions:write` scope (included in `manifest.example.json`); apps created before this scope was added must add it under **OAuth & Permissions** and reinstall. A missing scope is logged as a `WARNING`.
 - **Proactive updates (outbox)** — a running agent can post progress mid-run via the `orcai-say` skill, which appends to `$ORCAI_OUTBOX`; the router relays each message to Slack with the **bot token** — in-thread by default, or as a DM with `--dm` for escalation. Routing through the bot (not a separate MCP identity) is what lets it post into the bot's own DMs and channels. Mirror of the inbox; the agent never calls a Slack API directly.
