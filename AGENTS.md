@@ -30,11 +30,11 @@ A Slack-to-agent router: a Python service that listens for Slack messages and di
 
 ## Follow-up message delivery (router ↔ live agent)
 
-A follow-up message in a thread whose agent is still running is delivered to that **running** process rather than forking a second one. The moving parts:
+A follow-up message in a thread whose agent is still running is queued and handled by the **same session** rather than forking a second process. There are two layers — serialization is universal; mid-run delivery is opt-in:
 
-- **Opt-in per agent:** the whole mechanism is gated on `ProjectConfig.follow_thread` (config key `follow_thread: true`, default false). `spawn_engineer` only provisions the inbox (and exports `$ORCAI_INBOX`) for `follow_thread` agents; everything downstream keys off `SessionRecord.inbox_path` being set, so other agents keep the old behavior.
-- **Router side (`router/router.py`):** each `follow_thread` session gets a per-thread inbox file (`<workspace>/.orcai/inbox/<session>.jsonl`, path on `SessionRecord.inbox_path`, exported to the agent as `$ORCAI_INBOX`). `_try_route_event` enqueues to the inbox (and reacts 👀) when the thread's session is `running`/`draining`; `spawn_engineer` posts each agent turn live, and on exit drains any queued messages via a same-session `--resume` continuation.
-- **Agent side (example workspace):** the `PostToolUse`/`Stop` hooks (`projects/.orcai/hooks/`) read `$ORCAI_INBOX` and inject queued messages back into the live session; the `check-inbox` skill lets the agent poll explicitly during long waits. All hooks no-op when `$ORCAI_INBOX` is unset.
+- **Serialization (universal):** `spawn_engineer` provisions a per-thread inbox file (`<workspace>/.orcai/inbox/<session>.jsonl`, path on `SessionRecord.inbox_path`) for *every* tracked session. `_try_route_event` enqueues to it (and reacts 👀) when the thread's session is `running`/`draining` — no second process is spawned, and the original `session_by_thread` mapping is preserved. On exit, `spawn_engineer` drains any queued messages via a same-session `--resume` continuation.
+- **Mid-run delivery (opt-in via `follow_thread`):** `$ORCAI_INBOX` is exported to the agent **only** when `ProjectConfig.follow_thread` is true (config key `follow_thread: true`, default false). So a flag-off agent queues replies and picks them up on the next `--resume` after it finishes, but is never interrupted mid-flight; a flag-on agent additionally gets them injected into the live run.
+- **Agent side (example workspace):** the `PostToolUse`/`Stop` hooks (`projects/.orcai/hooks/`) read `$ORCAI_INBOX` and inject queued messages back into the live session; the `check-inbox` skill lets the agent poll explicitly during long waits. All hooks no-op when `$ORCAI_INBOX` is unset (i.e. for flag-off agents).
 
 ## Conventions
 

@@ -25,7 +25,7 @@ You (or GitHub/Azure DevOps bot) → Slack channel
   Slack thread reply  ←  result posted back
 ```
 
-The **router** is a lightweight async Python service connected to Slack via Socket Mode. It listens for `@BotName` mentions and integration bot messages (GitHub, Azure DevOps), spawns a `claude --agent` subprocess in the configured project workspace, and posts the result back to the Slack thread. Thread replies resume the previous Claude session automatically — and if the agent is still working, a follow-up in the same thread is queued and delivered to the running session instead of starting a second agent (see [Follow-up messages while an agent is running](#follow-up-messages-while-an-agent-is-running)).
+The **router** is a lightweight async Python service connected to Slack via Socket Mode. It listens for `@BotName` mentions and integration bot messages (GitHub, Azure DevOps), spawns a `claude --agent` subprocess in the configured project workspace, and posts the result back to the Slack thread. Thread replies resume the previous Claude session automatically — and if the agent is still working, a follow-up in the same thread is queued onto the same session and resumed when it finishes (or delivered mid-run with `follow_thread: true`) instead of starting a second agent (see [Follow-up messages while an agent is running](#follow-up-messages-while-an-agent-is-running)).
 
 ---
 
@@ -164,7 +164,7 @@ agents:
     backend: "claude"
     model: "claude-sonnet-4-6"
     timeout_minutes: 60
-    follow_thread: true        # optional — queue follow-ups to the running agent (default false)
+    follow_thread: true        # optional — deliver queued follow-ups mid-run (default false)
     slack:
       channels:
         - "#engineering-bots"
@@ -252,20 +252,20 @@ sudo systemctl daemon-reload && sudo systemctl enable --now router
 - **`@BotName <request>`** — strips the mention and forwards to the agent. Messages without a mention are ignored.
 - **GitHub / Azure DevOps integration bots** — forwarded automatically; no mention needed. Subscribe channels to events with `/github subscribe owner/repo issues pulls reviews comments`.
 - **Thread replies (idle session)** — resume the previous Claude session, preserving full context.
-- **Thread replies (busy session)** — queued to the running agent's inbox and picked up mid-run instead of forking a second agent (see below).
+- **Thread replies (busy session)** — queued onto the same session and resumed when the run finishes (or picked up mid-run with `follow_thread: true`) instead of forking a second agent (see below).
 - **Pickup ack** — the triggering message gets an 👀 reaction rather than a "picked up" text reply, keeping threads clean. Requires the bot's `reactions:write` scope (included in `manifest.example.json`); apps created before this scope was added must add it under **OAuth & Permissions** and reinstall. A missing scope is logged as a `WARNING`.
 - **Proactive updates (outbox)** — a running agent can post progress mid-run via the `orcai-say` skill, which appends to `$ORCAI_OUTBOX`; the router relays each message to Slack with the **bot token** — in-thread by default, or as a DM with `--dm` for escalation. Routing through the bot (not a separate MCP identity) is what lets it post into the bot's own DMs and channels. Mirror of the inbox; the agent never calls a Slack API directly.
 - **Concurrency** — defaults to 3 concurrent agent sessions. Override with `MAX_CONCURRENT=N` in the environment.
 
 ## Follow-up messages while an agent is running
 
-This is **opt-in per agent** — set `follow_thread: true` on the agent in the workspace `config.yaml` (off by default). When enabled, a follow-up in the same thread is delivered to the **already-running** agent rather than spawning a parallel one:
+A follow-up in the same thread is always **serialized into the same session** rather than spawning a parallel agent — this is universal, no config required. **Mid-run** delivery (steering the agent while it's still working) is the opt-in part: set `follow_thread: true` on the agent in the workspace `config.yaml` (off by default).
 
-1. The router appends the message to a per-session inbox file (`<workspace>/.orcai/inbox/<session>.jsonl`) and reacts 👀 on it — no second process is started.
-2. Workspace hooks surface it to the live agent: after each tool call (`PostToolUse`), and again if the agent tries to stop with messages still pending (`Stop`, which keeps the session alive to handle them). The agent can also poll explicitly with the `check-inbox` skill — recommended for long/async waits, run as a `sleep`+check loop.
-3. Anything that arrives after the process has already exited is drained by the router with a `--resume` continuation of the same session (a fresh prompt if a crash lost the session id).
+1. The router appends the message to a per-session inbox file (`<workspace>/.orcai/inbox/<session>.jsonl`) and reacts 👀 on it — no second process is started, and the thread keeps pointing at the running session.
+2. **When the run finishes**, the router drains anything queued with a `--resume` continuation of the same session (a fresh prompt if a crash lost the session id). This happens for every agent.
+3. **With `follow_thread: true` only**, the message is *also* surfaced to the live agent mid-run: after each tool call (`PostToolUse`), and again if the agent tries to stop with messages still pending (`Stop`, which keeps the session alive to handle them). The agent can also poll explicitly with the `check-inbox` skill — recommended for long/async waits, run as a `sleep`+check loop.
 
-Each answered message is posted back as its own thread reply. The hooks, the `check-inbox` skill, and the "poll during long waits" guidance ship in the example workspace under `projects/.claude/` and `projects/.orcai/hooks/` — copy them into your workspace and set `follow_thread: true` on the agent to enable. They no-op outside router runs and for agents without the flag (gated on the `ORCAI_INBOX` env var the router sets only for `follow_thread` agents).
+Each answered message is posted back as its own thread reply. The mid-run hooks, the `check-inbox` skill, and the "poll during long waits" guidance ship in the example workspace under `projects/.claude/` and `projects/.orcai/hooks/` — copy them in and set `follow_thread: true` to enable mid-run delivery. They no-op outside router runs and for flag-off agents (gated on the `ORCAI_INBOX` env var the router sets only for `follow_thread` agents).
 
 ---
 

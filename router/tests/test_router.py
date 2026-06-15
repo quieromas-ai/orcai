@@ -2080,16 +2080,15 @@ async def test_thread_reply_idle_session_resumes_not_enqueues(tmp_path: Path) ->
     assert _inbox_messages(inbox) == []  # idle path never queues
 
 
-async def test_running_session_without_follow_thread_acks_and_spawns(tmp_path: Path) -> None:
-    """Regression: a thread reply to a running agent that has follow_thread OFF (no inbox)
-    is NOT queued — it re-spawns — and must still be acked with a reaction at the routing
-    layer. Previously the only routing-layer ack was the follow_thread (inbox) busy path,
-    so flag-off agents never got the 👀 on follow-ups (and a flag-on agent's came from the
-    pre-semaphore queue ack), making the reaction appear "only when the flag is true"."""
+async def test_running_session_without_follow_thread_enqueues_not_forks(tmp_path: Path) -> None:
+    """Per-thread serialization is universal: a reply to a running follow_thread=OFF agent is
+    queued to its inbox (resumed after exit), NOT forked into a parallel process. It is acked
+    with a reaction, and the original session_by_thread mapping is preserved (not orphaned)."""
+    inbox = str(tmp_path / "inbox.jsonl")
     session_ref = "2026-04-05/1"
-    # inbox_path="" == follow_thread disabled — the busy/queue branch is skipped.
-    rec = _make_session(session_ref, state="running", inbox_path="")
-    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    # follow_thread is off, but the inbox is still provisioned for serialization.
+    rec = _make_session(session_ref, state="running", inbox_path=inbox)
+    channel_map = {"C001": make_project(name="proj", platform="slack")}  # follow_thread=False
     sessions = {session_ref: rec}
     session_by_thread = {"C001:ts-root": session_ref}
     seen_ts: deque[str] = deque(maxlen=1000)
@@ -2122,10 +2121,13 @@ async def test_running_session_without_follow_thread_acks_and_spawns(tmp_path: P
             session_counter={},
         )
 
-    mock_ct.assert_called_once()  # re-spawned (not queued — no inbox)
+    mock_ct.assert_not_called()  # queued, NOT forked into a parallel process
+    queued = _inbox_messages(inbox)
+    assert len(queued) == 1 and queued[0]["text"] == "any update?"
     slack_client.reactions_add.assert_called_once()
-    assert slack_client.reactions_add.call_args.kwargs["name"] == "eyes"
     assert slack_client.reactions_add.call_args.kwargs["timestamp"] == "ts-reply"
+    # the running session is still the one this thread maps to (not orphaned by a new spawn)
+    assert session_by_thread["C001:ts-root"] == session_ref
 
 
 async def test_idle_thread_reply_resume_acks_reaction(tmp_path: Path) -> None:
@@ -2425,6 +2427,58 @@ async def test_spawn_engineer_drains_inbox_on_exit_resumes(tmp_path: Path) -> No
     assert "second answer" in posts
 
 
+async def test_flag_false_drain_resumes_same_session(tmp_path: Path) -> None:
+    """Serialization is universal: even with follow_thread OFF, a message queued during the
+    run is drained afterward via a same-session resume (no parallel process, no new record)."""
+    project = make_project(workspace=str(tmp_path), agent_name="engineer")  # follow_thread=False
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+
+    cmds: list[list[str]] = []
+    envs: list[Any] = []
+    outs = [
+        _stream_json_with_session("first answer", "uuid-1"),
+        _stream_json_with_session("second answer", "uuid-2"),
+    ]
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        cmds.append([str(a) for a in args])
+        envs.append(kwargs.get("env"))
+        if len(cmds) == 1:
+            rec = next(iter(sessions.values()))
+            _append_to_inbox(rec.inbox_path, "U001", "follow up", "ts-2")
+        else:
+            assert len(sessions) == 1
+            assert next(iter(sessions.values())).state == "running"
+        data = outs.pop(0) if outs else b""
+        return _make_proc(data, returncode=0)
+
+    with patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await spawn_engineer(
+            project,
+            "initial task",
+            "C001",
+            "ts-root",
+            slack_client := AsyncMock(),
+            semaphore,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    assert len(cmds) == 2  # initial run + one drain run — serialized, not parallel
+    assert "uuid-1" in cmds[1]  # drain resumed the just-finished session
+    assert len(sessions) == 1  # same record reused, no new session minted
+    rec = next(iter(sessions.values()))
+    assert rec.state == "idle"
+    # follow_thread is off → no mid-run injection, so ORCAI_INBOX stays unset on both runs.
+    assert all("ORCAI_INBOX" not in (e or {}) for e in envs)
+    posts = [c.kwargs.get("text", "") for c in slack_client.chat_postMessage.call_args_list]
+    assert "first answer" in posts and "second answer" in posts
+
+
 async def test_spawn_engineer_drains_inbox_fresh_prompt_when_no_session_id(tmp_path: Path) -> None:
     """If the run crashed without a session id, the queued message drains as a fresh prompt."""
     project = make_project(workspace=str(tmp_path), agent_name="engineer", follow_thread=True)
@@ -2499,8 +2553,11 @@ async def test_spawn_engineer_no_drain_when_inbox_empty(tmp_path: Path) -> None:
     assert next(iter(sessions.values())).state == "idle"
 
 
-async def test_spawn_engineer_no_inbox_path_when_follow_thread_off(tmp_path: Path) -> None:
-    """A default (follow_thread off) agent provisions no inbox and sets no ORCAI_INBOX env."""
+async def test_spawn_engineer_inbox_provisioned_no_orcai_inbox_when_follow_thread_off(
+    tmp_path: Path,
+) -> None:
+    """A follow_thread=off agent still provisions an inbox (for serialization), but must NOT
+    expose ORCAI_INBOX — so its live process gets no mid-run hook injection."""
     project = make_project(workspace=str(tmp_path), agent_name="engineer")  # follow_thread=False
     semaphore = asyncio.Semaphore(2)
     sessions: dict[str, SessionRecord] = {}
@@ -2529,11 +2586,12 @@ async def test_spawn_engineer_no_inbox_path_when_follow_thread_off(tmp_path: Pat
         )
 
     rec = next(iter(sessions.values()))
-    assert rec.inbox_path == ""  # no inbox provisioned
-    # env is always set now (it carries the Slack coordinates); ORCAI_INBOX must be absent.
+    assert rec.inbox_path.endswith(".jsonl")  # inbox provisioned for serialization
+    assert "/.orcai/inbox/" in rec.inbox_path
+    # ORCAI_INBOX gates mid-run delivery — must be absent for a follow_thread=off agent.
     assert envs[0] is not None
     assert "ORCAI_INBOX" not in envs[0]
-    assert len(cmds) == 1  # no drain
+    assert len(cmds) == 1  # no drain (nothing was queued)
     assert rec.state == "idle"
 
 

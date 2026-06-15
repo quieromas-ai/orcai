@@ -82,7 +82,7 @@ class ProjectConfig:
     backend: str = "claude"
     model: str = "claude-sonnet-4-6"
     timeout_minutes: int = 60
-    follow_thread: bool = False  # opt-in: deliver follow-up thread messages to the running agent
+    follow_thread: bool = False  # opt-in: deliver follow-ups MID-RUN (serialize is universal)
     slack_bot_token: str = ""
     slack_app_token: str = field(default="", repr=False)
     mentions: dict[str, str] = field(default_factory=dict, repr=False)
@@ -559,12 +559,11 @@ async def spawn_engineer(
                 session_counter[counter_key] = session_counter.get(counter_key, 0) + 1
                 session_number = session_counter[counter_key]
                 session_ref = f"{date_str}/{session_number}"
-                # Inbox (and therefore the whole follow-thread mechanism) is opt-in per agent.
-                inbox_path = (
-                    _inbox_path_for(project.workspace, session_ref)
-                    if project.follow_thread
-                    else ""
-                )
+                # Per-thread serialization queue — provisioned for every tracked session so a
+                # reply to a still-running agent is queued (and resumed after exit) instead of
+                # forking a second parallel process. Mid-run delivery of this queue is opt-in
+                # via follow_thread (ORCAI_INBOX, set below); serialization itself is universal.
+                inbox_path = _inbox_path_for(project.workspace, session_ref)
                 sessions[session_ref] = SessionRecord(
                     number=session_number,
                     date_str=date_str,
@@ -626,11 +625,13 @@ async def spawn_engineer(
             exit_code = -1
             claude_session_id = ""
 
-            # Expose the inbox path (router→agent: poll skill + PostToolUse/Stop hooks read
-            # follow-ups mid-run) and the outbox path (agent→router: the `orcai-say` skill queues
-            # proactive messages the router relays to Slack with the bot token). Inherited via exec.
+            # Expose the inbox path only when follow_thread is on (router→agent: poll skill +
+            # PostToolUse/Stop hooks read follow-ups MID-RUN). The inbox file is provisioned for
+            # every session for serialization/drain, but flag-off agents must not get mid-run
+            # injection — so ORCAI_INBOX is gated on the flag. The outbox path (agent→router: the
+            # `orcai-say` skill relays proactive messages via the bot token) is unconditional.
             run_env = {**os.environ}
-            if inbox_path:
+            if inbox_path and project.follow_thread:
                 run_env["ORCAI_INBOX"] = inbox_path
             if outbox_path:
                 run_env["ORCAI_OUTBOX"] = outbox_path
