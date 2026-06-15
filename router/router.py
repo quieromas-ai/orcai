@@ -25,6 +25,7 @@ ROUTER_DIR = os.path.dirname(os.path.abspath(__file__))
 AGENT_RUNNER = os.path.join(ROUTER_DIR, "agent_runner.sh")
 ROUTER_CONFIG = os.path.join(ROUTER_DIR, "config.yaml")
 SLACK_MAX_LENGTH = 3900
+SLACK_MAX_MESSAGES = 20  # cap on posts per logical message; tail beyond this is truncated
 OUTBOX_POLL_SECONDS = 1.5  # how often the router relays the agent's queued proactive messages
 _MENTION_RE = re.compile(r"@(\w+)")
 _DEFAULT_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
@@ -438,11 +439,51 @@ async def fetch_thread_context(
         return ""
 
 
+def _split_for_slack(
+    text: str, limit: int = SLACK_MAX_LENGTH, max_chunks: int = SLACK_MAX_MESSAGES
+) -> list[str]:
+    """Split text into chunks each <= limit, preferring newline boundaries so we rarely break
+    mid-line. A single over-long line is hard-split. If the result exceeds max_chunks, keep the
+    first max_chunks chunks and append a truncation notice to the last kept chunk."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    if len(chunks) > max_chunks:
+        notice = "\n... (truncated)"
+        kept = chunks[:max_chunks]
+        kept[-1] = kept[-1][: limit - len(notice)] + notice
+        chunks = kept
+    return chunks
+
+
+async def _post_chunked(slack_client: Any, base_kwargs: dict[str, Any], text: str) -> int:
+    """Post text to Slack, splitting into multiple sequential messages if over the limit.
+    Reuses base_kwargs (channel/thread_ts) for every chunk. Returns chunks posted."""
+    posted = 0
+    for chunk in _split_for_slack(text):
+        await slack_client.chat_postMessage(**{**base_kwargs, "text": chunk})
+        posted += 1
+    return posted
+
+
 def _build_reply_text(project_name: str, exit_code: int, result_text: str, log_path: str) -> str:
     """Build the Slack reply text based on agent outcome."""
     if exit_code == 0 and result_text:
-        if len(result_text) > SLACK_MAX_LENGTH:
-            result_text = result_text[:SLACK_MAX_LENGTH] + "\n... (truncated)"
         return result_text
     if exit_code == 0:
         return f"Agent completed for project *{project_name}* but produced no output."
@@ -666,14 +707,12 @@ async def spawn_engineer(
                         if not turn_text:
                             continue
                         turn_text = _resolve_mentions(turn_text, project.mentions)
-                        if len(turn_text) > SLACK_MAX_LENGTH:
-                            turn_text = turn_text[:SLACK_MAX_LENGTH] + "\n... (truncated)"
-                        turn_kwargs: dict[str, Any] = {"channel": channel_id, "text": turn_text}
+                        turn_kwargs: dict[str, Any] = {"channel": channel_id}
                         if thread_ts:
                             turn_kwargs["thread_ts"] = thread_ts
                         try:
-                            await slack_client.chat_postMessage(**turn_kwargs)
-                            posted_count += 1
+                            if await _post_chunked(slack_client, turn_kwargs, turn_text):
+                                posted_count += 1
                         except Exception as e:
                             logger.error("Failed to post Slack turn: %s", e)
 
@@ -690,19 +729,17 @@ async def spawn_engineer(
                         text = _resolve_mentions(str(m.get("text", "")), project.mentions)
                         if not text:
                             continue
-                        if len(text) > SLACK_MAX_LENGTH:
-                            text = text[:SLACK_MAX_LENGTH] + "\n... (truncated)"
                         if m.get("dm"):
                             target = trigger_user or channel_id
-                            out_kwargs: dict[str, Any] = {"channel": target, "text": text}
+                            out_kwargs: dict[str, Any] = {"channel": target}
                         else:
-                            out_kwargs = {"channel": channel_id, "text": text}
+                            out_kwargs = {"channel": channel_id}
                             if thread_ts:
                                 out_kwargs["thread_ts"] = thread_ts
                         if not out_kwargs["channel"]:
                             continue
                         try:
-                            await slack_client.chat_postMessage(**out_kwargs)
+                            await _post_chunked(slack_client, out_kwargs, text)
                         except Exception as e:
                             logger.warning("Failed to relay outbox message: %s", e)
 
@@ -769,11 +806,11 @@ async def spawn_engineer(
             # path already posted each turn live in _stream_stdout).
             if posted_count == 0:
                 reply_text = _build_reply_text(project.name, exit_code, result_text, log_path)
-                reply_kwargs: dict[str, Any] = {"channel": channel_id, "text": reply_text}
+                reply_kwargs: dict[str, Any] = {"channel": channel_id}
                 if thread_ts:
                     reply_kwargs["thread_ts"] = thread_ts
                 try:
-                    await slack_client.chat_postMessage(**reply_kwargs)
+                    await _post_chunked(slack_client, reply_kwargs, reply_text)
                 except Exception as e:
                     logger.error("Failed to post Slack response: %s", e)
 

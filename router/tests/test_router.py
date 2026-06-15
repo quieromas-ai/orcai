@@ -25,6 +25,7 @@ from router import (
 )
 from router.router import (
     SLACK_MAX_LENGTH,
+    SLACK_MAX_MESSAGES,
     DailyDirectoryFileHandler,
     _add_reaction,
     _append_to_inbox,
@@ -34,6 +35,7 @@ from router.router import (
     _outbox_path_for,
     _resolve_mentions,
     _session_id_from_log,
+    _split_for_slack,
     _try_route_event,
     fetch_thread_context,
 )
@@ -441,7 +443,32 @@ async def test_spawn_engineer_failure_posts_error(tmp_path: Path) -> None:
     assert "exit code 1" in text
 
 
-async def test_spawn_engineer_truncates_long_result(tmp_path: Path) -> None:
+def test_split_for_slack_unit() -> None:
+    # Short text is a single chunk, unchanged.
+    assert _split_for_slack("hello") == ["hello"]
+
+    # Long multi-line text splits into chunks that each fit and rejoin to the original.
+    body = "\n".join(f"line {i} " + "y" * 80 for i in range(200))
+    chunks = _split_for_slack(body)
+    assert len(chunks) >= 2
+    assert all(len(c) <= SLACK_MAX_LENGTH for c in chunks)
+    assert "".join(chunks) == body
+
+    # A single over-long line (no newline boundaries) is hard-split, losing nothing.
+    one_line = "z" * (SLACK_MAX_LENGTH * 2 + 100)
+    chunks = _split_for_slack(one_line)
+    assert all(len(c) <= SLACK_MAX_LENGTH for c in chunks)
+    assert "".join(chunks) == one_line
+
+    # Output exceeding max_chunks is capped, and the last kept chunk carries the notice.
+    huge = "a" * (SLACK_MAX_LENGTH * (SLACK_MAX_MESSAGES + 5))
+    chunks = _split_for_slack(huge)
+    assert len(chunks) == SLACK_MAX_MESSAGES
+    assert all(len(c) <= SLACK_MAX_LENGTH for c in chunks)
+    assert chunks[-1].endswith("... (truncated)")
+
+
+async def test_spawn_engineer_splits_long_result(tmp_path: Path) -> None:
     long_text = "x" * 4000
     stdout = _stream_json(long_text)
     proc = _make_proc(stdout, returncode=0)
@@ -452,9 +479,11 @@ async def test_spawn_engineer_truncates_long_result(tmp_path: Path) -> None:
     with patch("router.router.asyncio.create_subprocess_exec", return_value=proc):
         await spawn_engineer(project, "do something", "C001", None, slack_client, semaphore)
 
-    text = slack_client.chat_postMessage.call_args.kwargs["text"]
-    assert "truncated" in text
-    assert len(text) <= 3930
+    chunks = [c.kwargs["text"] for c in slack_client.chat_postMessage.call_args_list]
+    assert len(chunks) >= 2  # 4000 chars exceeds the 3900 limit, so it splits
+    assert all(len(c) <= SLACK_MAX_LENGTH for c in chunks)
+    assert "truncated" not in "".join(chunks)  # nothing dropped
+    assert "".join(chunks) == long_text  # full content preserved across chunks
 
 
 async def test_spawn_engineer_timeout_kills_and_posts_error(tmp_path: Path) -> None:
@@ -2897,7 +2926,7 @@ async def test_outbox_dm_posted_to_user(tmp_path: Path) -> None:
     assert "thread_ts" not in dm[0].kwargs
 
 
-async def test_outbox_mentions_resolved_and_truncated(tmp_path: Path) -> None:
+async def test_outbox_mentions_resolved_and_split(tmp_path: Path) -> None:
     proc = _make_proc(_stream_json("final"), returncode=0)
     project = make_project(workspace=str(tmp_path), mentions={"reviewer": "U999"})
     semaphore = asyncio.Semaphore(1)
@@ -2911,14 +2940,18 @@ async def test_outbox_mentions_resolved_and_truncated(tmp_path: Path) -> None:
             sessions={}, session_by_thread={}, session_counter={},
         )
 
-    posted = [
+    # The 5010-char outbox payload exceeds the 3900 limit, so it relays as multiple chunks.
+    chunks = [
         c.kwargs["text"]
         for c in slack.chat_postMessage.call_args_list
-        if "<@U999>" in c.kwargs.get("text", "")
+        if "x" in c.kwargs.get("text", "")
     ]
-    assert posted
-    assert posted[0].endswith("... (truncated)")
-    assert len(posted[0]) <= SLACK_MAX_LENGTH + len("\n... (truncated)")
+    assert len(chunks) >= 2
+    assert all(len(c) <= SLACK_MAX_LENGTH for c in chunks)
+    joined = "".join(chunks)
+    assert "<@U999>" in joined  # mention resolved
+    assert joined.count("x") == 5000  # full payload preserved across chunks
+    assert "truncated" not in joined
 
 
 async def test_outbox_no_duplicate_posts(tmp_path: Path) -> None:
