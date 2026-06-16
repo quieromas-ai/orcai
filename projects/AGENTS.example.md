@@ -27,3 +27,11 @@ the wait as a poll loop (e.g. launch the work in the background, then repeatedly
 check status), so queued messages reach you promptly. You can also check explicitly at any time
 with the `check-inbox` skill. Treat any new message as a fresh instruction: acknowledge it and
 adapt your current plan.
+
+## Self-paced wakeups
+
+If you have background work to poll and no reply will wake you, schedule your next turn before
+exiting via the `orcai-wake` skill: `python3 "$ORCAI_WAKE_BIN" --delay <s> --reason "…" --prompt
+"<where state lives + what to do>"`. The router re-spawns you with `--resume` when it fires; a real
+reply first cancels it. Do **not** use the harness `ScheduleWakeup`/`/loop` — they never fire in a
+headless run. No-op when `$ORCAI_WAKE` is unset (not a wakeup-enabled agent).

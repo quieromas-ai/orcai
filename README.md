@@ -37,7 +37,7 @@ orcai-slack/
 │   ├── router.py             # Main entry point
 │   ├── agent_runner.sh       # Spawns claude / cursor-agent
 │   ├── platforms/            # Message parsers (slack, github, azure_devops)
-│   ├── tests/                # pytest suite (138 tests)
+│   ├── tests/                # pytest suite (189 tests)
 │   ├── config.example.yaml
 │   ├── .env.example
 │   └── router.service.example
@@ -51,9 +51,11 @@ orcai-slack/
     │   ├── agents/
     │   │   └── engineer.md    # Software engineer agent example
     │   └── skills/
-    │       └── check-inbox/   # poll skill for follow-ups mid-run
+    │       ├── orcai-say/     # post Slack updates / DMs mid-run
+    │       ├── check-inbox/   # poll skill for follow-ups mid-run
+    │       └── orcai-wake/    # schedule an autonomous resume (self-pacing)
     └── .orcai/
-        └── hooks/             # inbox_inject.sh, inbox_drain.sh, inbox_emit.py
+        └── hooks/             # inbox_*.{sh,py}, outbox_say.py, outbox_wake.py
 ```
 
 ---
@@ -165,6 +167,7 @@ agents:
     model: "claude-sonnet-4-6"
     timeout_minutes: 60
     follow_thread: true        # optional — deliver queued follow-ups mid-run (default false)
+    wakeup_enabled: true       # optional — agent may self-schedule resumes via orcai-wake (default false)
     slack:
       channels:
         - "#engineering-bots"
@@ -255,6 +258,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now router
 - **Thread replies (busy session)** — queued onto the same session and resumed when the run finishes (or picked up mid-run with `follow_thread: true`) instead of forking a second agent (see below).
 - **Pickup ack** — the triggering message gets an 👀 reaction rather than a "picked up" text reply, keeping threads clean. Requires the bot's `reactions:write` scope (included in `manifest.example.json`); apps created before this scope was added must add it under **OAuth & Permissions** and reinstall. A missing scope is logged as a `WARNING`.
 - **Proactive updates (outbox)** — a running agent can post progress mid-run via the `orcai-say` skill, which appends to `$ORCAI_OUTBOX`; the router relays each message to Slack with the **bot token** — in-thread by default, or as a DM with `--dm` for escalation. Routing through the bot (not a separate MCP identity) is what lets it post into the bot's own DMs and channels. Mirror of the inbox; the agent never calls a Slack API directly.
+- **Self-paced wakeups (orcai-wake)** — a `wakeup_enabled` agent can schedule its own next turn before exiting via the `orcai-wake` skill (writes `$ORCAI_WAKE`); on a clean idle exit the router arms a timer and re-spawns the session with `--resume` when it fires. Lets a headless agent poll long-running background work autonomously, with no human reply to wake it. A real thread reply that lands first cancels the pending wakeup. See [Self-paced wakeups](#self-paced-wakeups-autonomous-resume).
 - **Concurrency** — defaults to 3 concurrent agent sessions. Override with `MAX_CONCURRENT=N` in the environment.
 
 ## Follow-up messages while an agent is running
@@ -266,6 +270,18 @@ A follow-up in the same thread is always **serialized into the same session** ra
 3. **With `follow_thread: true` only**, the message is *also* surfaced to the live agent mid-run: after each tool call (`PostToolUse`), and again if the agent tries to stop with messages still pending (`Stop`, which keeps the session alive to handle them). The agent can also poll explicitly with the `check-inbox` skill — recommended for long/async waits, run as a `sleep`+check loop.
 
 Each answered message is posted back as its own thread reply. The mid-run hooks, the `check-inbox` skill, and the "poll during long waits" guidance ship in the example workspace under `projects/.claude/` and `projects/.orcai/hooks/` — copy them in and set `follow_thread: true` to enable mid-run delivery. They no-op outside router runs and for flag-off agents (gated on the `ORCAI_INBOX` env var the router sets only for `follow_thread` agents).
+
+---
+
+## Self-paced wakeups (autonomous resume)
+
+Headless `claude -p` agents exit after one turn, so the harness `ScheduleWakeup` / `/loop` timers never fire — their timer lives in a resident session the agent doesn't have. For an agent that must poll background work (a delegated task, a build, a long orchestration run) without a human reply to wake it, set `wakeup_enabled: true` on the agent in the workspace `config.yaml` (off by default).
+
+1. Before ending its turn, the agent writes a request via the `orcai-wake` skill — `python3 "$ORCAI_WAKE_BIN" --delay <seconds> --reason "…" --prompt "…"` — which the router exposes (`$ORCAI_WAKE`, `$ORCAI_WAKE_BIN`) only for wakeup-enabled agents.
+2. On a **clean idle exit**, the router reads the request, clamps the delay to `[60, 3600]s`, and arms an in-memory timer. When it fires, the router re-spawns the session with `--resume` and the given prompt — exactly like a thread reply, so the agent continues with fresh context.
+3. A real Slack reply (or an inbox drain) that lands first **cancels** the pending wakeup, so a session is never resumed twice. The timer is in-memory: a router restart drops it, but the session still resumes on the next reply.
+
+The `orcai-wake` skill and `outbox_wake.py` helper ship in the example workspace under `projects/.claude/skills/` and `projects/.orcai/hooks/`. Both no-op outside router runs and for non-wakeup agents (gated on `$ORCAI_WAKE`).
 
 ---
 
@@ -303,7 +319,7 @@ Required PAT scopes: `Code (Read & Write)`, `Pull Request Threads (Read & Write)
 cd router && .venv/bin/python -m pytest tests/ -v
 ```
 
-138 tests, no external dependencies required.
+189 tests, no external dependencies required.
 
 ---
 
