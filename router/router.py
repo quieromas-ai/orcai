@@ -27,6 +27,12 @@ ROUTER_CONFIG = os.path.join(ROUTER_DIR, "config.yaml")
 SLACK_MAX_LENGTH = 3900
 SLACK_MAX_MESSAGES = 20  # cap on posts per logical message; tail beyond this is truncated
 OUTBOX_POLL_SECONDS = 1.5  # how often the router relays the agent's queued proactive messages
+WAKE_MIN_SECONDS = 60  # wakeup delay clamp floor (mirrors the harness ScheduleWakeup bounds)
+WAKE_MAX_SECONDS = 3600  # wakeup delay clamp ceiling
+DEFAULT_WAKE_PROMPT = (
+    "WAKEUP: the wakeup you scheduled has fired. Resume your in-flight work — read any "
+    "run/orchestration state from disk first, then continue."
+)
 _MENTION_RE = re.compile(r"@(\w+)")
 _DEFAULT_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 _DEFAULT_APP_TOKEN_ENV = "SLACK_APP_TOKEN"
@@ -84,6 +90,7 @@ class ProjectConfig:
     model: str = "claude-sonnet-4-6"
     timeout_minutes: int = 60
     follow_thread: bool = False  # opt-in: deliver follow-ups MID-RUN (serialize is universal)
+    wakeup_enabled: bool = False  # opt-in: agent may schedule a router-armed wakeup (ORCAI_WAKE)
     slack_bot_token: str = ""
     slack_app_token: str = field(default="", repr=False)
     mentions: dict[str, str] = field(default_factory=dict, repr=False)
@@ -100,6 +107,9 @@ class SessionRecord:
     created_at: datetime
     state: str  # "running" | "draining" | "idle"
     inbox_path: str = ""  # per-session router→live-agent IPC file (empty if untracked)
+    # Pending router-armed wakeup timer (set when an idle session left a wake request); cancelled
+    # if real Slack traffic resumes the thread first. In-memory only — lost on a router restart.
+    wake_handle: asyncio.TimerHandle | None = field(default=None, repr=False)
 
     @property
     def ref(self) -> str:
@@ -160,6 +170,7 @@ def load_projects(router_config_path: str) -> list[ProjectConfig]:
                         model=agent_entry.get("model", "claude-sonnet-4-6"),
                         timeout_minutes=agent_entry.get("timeout_minutes", 60),
                         follow_thread=agent_entry.get("follow_thread", False),
+                        wakeup_enabled=agent_entry.get("wakeup_enabled", False),
                         slack_bot_token=workspace_env.get(bot_env) or os.environ.get(bot_env, ""),
                         slack_app_token=workspace_env.get(app_env) or os.environ.get(app_env, ""),
                     )
@@ -180,6 +191,7 @@ def load_projects(router_config_path: str) -> list[ProjectConfig]:
                     model=agent_cfg.get("model", "claude-sonnet-4-6"),
                     timeout_minutes=agent_cfg.get("timeout_minutes", 60),
                     follow_thread=agent_cfg.get("follow_thread", False),
+                    wakeup_enabled=agent_cfg.get("wakeup_enabled", False),
                     slack_bot_token=os.environ.get(_DEFAULT_BOT_TOKEN_ENV, ""),
                     slack_app_token=os.environ.get(_DEFAULT_APP_TOKEN_ENV, ""),
                 )
@@ -338,6 +350,63 @@ def _clear_outbox(outbox_path: str) -> None:
     if outbox_path:
         with contextlib.suppress(OSError):
             os.remove(outbox_path)
+
+
+def _wake_path_for(workspace: str, session_ref: str) -> str:
+    """Filesystem path of the per-session wake-request file (live-agent → router control channel).
+
+    Separate from the outbox: the outbox is relayed to Slack, whereas a wake request is a private
+    control signal the router consumes to arm a timer. The agent writes it via the `orcai-wake`
+    skill before ending its turn.
+    """
+    safe = session_ref.replace("/", "-")
+    return os.path.join(workspace, ".orcai", "wake", f"{safe}.json")
+
+
+def _read_wake_request(wake_path: str) -> dict[str, Any] | None:
+    """Parsed wake request ({'delay_seconds','reason','prompt'}) or None.
+
+    The file is a single JSON object overwritten on each request (last-write-wins), so only the
+    final request before the turn ends takes effect. Returns None when missing, empty, malformed,
+    or carrying a non-positive delay.
+    """
+    if not wake_path:
+        return None
+    try:
+        with open(wake_path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_delay = data.get("delay_seconds")
+    if raw_delay is None:
+        return None
+    try:
+        delay = int(raw_delay)
+    except (TypeError, ValueError):
+        return None
+    if delay <= 0:
+        return None
+    return cast(dict[str, Any], data)
+
+
+def _clear_wake(wake_path: str) -> None:
+    """Remove the wake-request file once the router has claimed it."""
+    if wake_path:
+        with contextlib.suppress(OSError):
+            os.remove(wake_path)
+
+
+def _cancel_wake(rec: "SessionRecord") -> None:
+    """Cancel a session's pending wakeup timer, if any.
+
+    Called when real Slack traffic resumes (or supersedes) the thread before the timer fires, so
+    the wakeup does not spawn a second, redundant resume of the same session.
+    """
+    if rec.wake_handle is not None:
+        rec.wake_handle.cancel()
+        rec.wake_handle = None
 
 
 def _slack_ts_sort_key(msg: dict[str, Any]) -> float:
@@ -617,11 +686,23 @@ async def spawn_engineer(
                     inbox_path=inbox_path,
                 )
                 if thread_ts:
+                    # A new record supersedes this thread's prior session — cancel any wakeup the
+                    # prior session left armed so it cannot fire a stale, redundant resume.
+                    prior_ref = session_by_thread.get(f"{channel_id}:{thread_ts}")
+                    if prior_ref and prior_ref in sessions:
+                        _cancel_wake(sessions[prior_ref])
                     session_by_thread[f"{channel_id}:{thread_ts}"] = session_ref
 
             # Outbox is provisioned for any tracked session so the agent can post proactive
             # updates the router relays via the bot token (independent of inbox/follow_thread).
             outbox_path = _outbox_path_for(project.workspace, session_ref) if session_ref else ""
+            # Wake-request channel is provisioned only for wakeup-enabled agents: the file the
+            # agent writes (via `orcai-wake`) so the router arms a timer to resume it autonomously.
+            wake_path = (
+                _wake_path_for(project.workspace, session_ref)
+                if session_ref and project.wakeup_enabled
+                else ""
+            )
 
             log_name = (
                 # Distinct log per drain cycle so the canonical session log isn't clobbered.
@@ -680,6 +761,13 @@ async def spawn_engineer(
                 # $CLAUDE_PROJECT_DIR (which is unset inside headless `claude -p` agent runs).
                 run_env["ORCAI_SAY"] = os.path.join(
                     project.workspace, ".orcai", "hooks", "outbox_say.py"
+                )
+            # Wake channel: the agent writes its next-wakeup request here via `orcai-wake`; the
+            # router reads it after the turn exits and arms a timer. Gated on wakeup_enabled.
+            if wake_path:
+                run_env["ORCAI_WAKE"] = wake_path
+                run_env["ORCAI_WAKE_BIN"] = os.path.join(
+                    project.workspace, ".orcai", "hooks", "outbox_wake.py"
                 )
 
             with open(log_path, "wb") as log_file:
@@ -785,6 +873,35 @@ async def spawn_engineer(
             # it so a resumed/drained continuation of this session starts from a clean file.
             _clear_outbox(outbox_path)
 
+            def _fire_wakeup(ref: str, wake_prompt: str) -> None:
+                # Timer callback (sync): re-spawn the session via --resume, mirroring a Slack
+                # auto-resume. Re-checks state under the guard so a real message that resumed the
+                # thread first (which cancels this handle) cannot be double-served here.
+                if sessions is None:
+                    return
+                wrec = sessions.get(ref)
+                if wrec is None or wrec.state != "idle" or not wrec.claude_session_id:
+                    return
+                wrec.wake_handle = None
+                logger.info("Wakeup firing for #%s → resuming %s", ref, wrec.claude_session_id)
+                asyncio.create_task(
+                    spawn_engineer(
+                        project,
+                        wake_prompt,
+                        wrec.channel_id,
+                        wrec.thread_ts or None,
+                        slack_client,
+                        semaphore,
+                        channel_type=channel_type,
+                        trigger_user=trigger_user,
+                        user_cache=user_cache,
+                        sessions=sessions,
+                        session_by_thread=session_by_thread,
+                        session_counter=session_counter,
+                        resume_session_id=wrec.claude_session_id,
+                    )
+                )
+
             # ---- Race-safe post-run transition: decided synchronously, BEFORE any await, so
             # there is never a moment where the record reads "idle" while its inbox is
             # non-empty. A message arriving during the Slack posts below therefore sees
@@ -795,12 +912,38 @@ async def spawn_engineer(
                 pending = _inbox_messages(rec.inbox_path)
                 if pending:
                     _clear_inbox(rec.inbox_path)  # claim the queue synchronously
+                    # Discard any wake request from this turn: the drain already resumes the
+                    # session, so a stale wakeup must not arm on top of it.
+                    _clear_wake(wake_path)
                     drain_batch = pending
                     drain_resume_id = rec.claude_session_id or None
                     drain_ref = session_ref
                     rec.state = "draining"
                 else:
                     rec.state = "idle"
+                    # Arm a router-owned wakeup if the agent requested one on a clean exit. Only in
+                    # the idle branch (never mid-drain): the timer re-spawns this session via
+                    # --resume — the native-compatible replacement for in-session ScheduleWakeup,
+                    # which a headless `claude -p` process cannot honour after it exits.
+                    if wake_path and exit_code == 0:
+                        req = _read_wake_request(wake_path)
+                        _clear_wake(wake_path)  # claim it (last-write-wins; single request)
+                        if req is not None:
+                            delay = max(
+                                WAKE_MIN_SECONDS, min(WAKE_MAX_SECONDS, int(req["delay_seconds"]))
+                            )
+                            rec.wake_handle = asyncio.get_running_loop().call_later(
+                                delay,
+                                _fire_wakeup,
+                                session_ref,
+                                str(req.get("prompt") or DEFAULT_WAKE_PROMPT),
+                            )
+                            logger.info(
+                                "Armed wakeup for #%s in %ds (%s)",
+                                session_ref,
+                                delay,
+                                req.get("reason", ""),
+                            )
 
             # Post a fallback/error only when nothing was streamed to the thread (the success
             # path already posted each turn live in _stream_stdout).
@@ -1019,6 +1162,7 @@ async def _try_route_event(
         if busy_ref:
             busy_rec = sessions.get(busy_ref)
             if busy_rec and busy_rec.state in ("running", "draining") and busy_rec.inbox_path:
+                _cancel_wake(busy_rec)  # defensive: live thread, no stale wakeup should linger
                 queued_user = source.get("user", "") or source.get("username", "")
                 _append_to_inbox(busy_rec.inbox_path, queued_user, queued_text, msg_ts)
                 await _add_reaction(slack_client, channel, msg_ts, "eyes")
@@ -1042,6 +1186,7 @@ async def _try_route_event(
             rec = sessions.get(existing_ref)
             if rec and rec.state == "idle" and rec.claude_session_id:
                 resume_session_id = rec.claude_session_id
+                _cancel_wake(rec)  # a real reply wins — drop any pending wakeup for this session
                 logger.info("Thread auto-resume session #%s → %s", existing_ref, resume_session_id)
 
     # DM starting with "#YYYY-MM-DD/N <message>" resumes a named session.
@@ -1055,6 +1200,7 @@ async def _try_route_event(
             if rec and rec.state == "idle" and rec.claude_session_id:
                 resume_session_id = rec.claude_session_id
                 text = remainder
+                _cancel_wake(rec)  # a real reply wins — drop any pending wakeup for this session
                 logger.info("DM explicit resume #%s", target_ref)
             else:
                 date_part, num_part = SessionRecord.parse_ref(target_ref)

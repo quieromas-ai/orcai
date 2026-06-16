@@ -12,6 +12,7 @@ HOOKS_DIR = Path(__file__).resolve().parents[2] / "projects" / ".orcai" / "hooks
 DRAIN = HOOKS_DIR / "inbox_drain.sh"
 INJECT = HOOKS_DIR / "inbox_inject.sh"
 OUTBOX_SAY = HOOKS_DIR / "outbox_say.py"
+OUTBOX_WAKE = HOOKS_DIR / "outbox_wake.py"
 
 
 def _run_say(outbox: str | None, *args: str) -> subprocess.CompletedProcess[str]:
@@ -131,5 +132,55 @@ def test_outbox_say_joins_multiword_message(tmp_path: Path) -> None:
 
 def test_outbox_say_noop_when_unset(tmp_path: Path) -> None:
     result = _run_say(None, "nothing should happen")  # ORCAI_OUTBOX unset
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def _run_wake(wake: str | None, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"}
+    if wake is not None:
+        env["ORCAI_WAKE"] = wake
+    return subprocess.run(
+        ["python3", str(OUTBOX_WAKE), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def test_outbox_wake_writes_request(tmp_path: Path) -> None:
+    wake = tmp_path / "wake.json"
+    result = _run_wake(str(wake), "--delay", "1200", "--reason", "r", "--prompt", "p")
+    assert result.returncode == 0
+    assert json.loads(wake.read_text()) == {
+        "delay_seconds": 1200,
+        "reason": "r",
+        "prompt": "p",
+    }
+
+
+def test_outbox_wake_last_write_wins(tmp_path: Path) -> None:
+    wake = tmp_path / "wake.json"
+    _run_wake(str(wake), "--delay", "1200", "--reason", "first", "--prompt", "p1")
+    _run_wake(str(wake), "--delay", "50", "--reason", "second", "--prompt", "p2")
+    # Overwritten, not appended: a single JSON object reflecting only the latest request.
+    data = json.loads(wake.read_text())
+    assert data == {"delay_seconds": 50, "reason": "second", "prompt": "p2"}
+
+
+def test_outbox_wake_defaults_blank_reason_prompt(tmp_path: Path) -> None:
+    wake = tmp_path / "wake.json"
+    result = _run_wake(str(wake), "--delay", "300")
+    assert result.returncode == 0
+    assert json.loads(wake.read_text()) == {
+        "delay_seconds": 300,
+        "reason": "",
+        "prompt": "",
+    }
+
+
+def test_outbox_wake_noop_when_unset(tmp_path: Path) -> None:
+    result = _run_wake(None, "--delay", "300")  # ORCAI_WAKE unset
     assert result.returncode == 0
     assert result.stdout.strip() == ""

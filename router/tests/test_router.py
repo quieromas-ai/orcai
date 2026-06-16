@@ -24,19 +24,26 @@ from router import (
     supervise_slack,
 )
 from router.router import (
+    DEFAULT_WAKE_PROMPT,
     SLACK_MAX_LENGTH,
     SLACK_MAX_MESSAGES,
+    WAKE_MAX_SECONDS,
+    WAKE_MIN_SECONDS,
     DailyDirectoryFileHandler,
     _add_reaction,
     _append_to_inbox,
+    _cancel_wake,
+    _clear_wake,
     _extract_result,
     _inbox_messages,
     _is_unchanged_message_edit,
     _outbox_path_for,
+    _read_wake_request,
     _resolve_mentions,
     _session_id_from_log,
     _split_for_slack,
     _try_route_event,
+    _wake_path_for,
     fetch_thread_context,
 )
 
@@ -3119,3 +3126,257 @@ async def test_final_result_still_posted_once(tmp_path: Path) -> None:
     ]
     assert len(posts) == 1
     assert posts[0].kwargs["thread_ts"] == "ts-root"
+
+
+# ---------------------------------------------------------------------------
+# wake-request helpers + router-armed wakeup scheduler
+# ---------------------------------------------------------------------------
+
+
+def test_wake_path_for_encodes_ref(tmp_path: Path) -> None:
+    p = _wake_path_for(str(tmp_path), "2026-06-16/3")
+    assert p == str(tmp_path / ".orcai" / "wake" / "2026-06-16-3.json")
+
+
+def _write_wake(path: str, **fields: object) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload: dict[str, object] = {"delay_seconds": 1200, "reason": "", "prompt": ""}
+    payload.update(fields)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+
+def test_read_wake_request_parses(tmp_path: Path) -> None:
+    p = str(tmp_path / "wake.json")
+    _write_wake(p, delay_seconds=300, reason="r", prompt="p")
+    assert _read_wake_request(p) == {"delay_seconds": 300, "reason": "r", "prompt": "p"}
+
+
+def test_read_wake_request_missing_or_blank(tmp_path: Path) -> None:
+    assert _read_wake_request("") is None
+    assert _read_wake_request(str(tmp_path / "nope.json")) is None
+
+
+def test_read_wake_request_rejects_nonpositive_and_malformed(tmp_path: Path) -> None:
+    bad_delay = str(tmp_path / "bad.json")
+    _write_wake(bad_delay, delay_seconds=0)
+    assert _read_wake_request(bad_delay) is None
+
+    not_int = str(tmp_path / "notint.json")
+    _write_wake(not_int, delay_seconds="soon")
+    assert _read_wake_request(not_int) is None
+
+    garbage = str(tmp_path / "garbage.json")
+    with open(garbage, "w", encoding="utf-8") as f:
+        f.write("not json{")
+    assert _read_wake_request(garbage) is None
+
+
+def test_clear_wake_removes_file(tmp_path: Path) -> None:
+    p = str(tmp_path / "wake.json")
+    _write_wake(p)
+    _clear_wake(p)
+    assert not os.path.exists(p)
+    _clear_wake(p)  # idempotent — no error on a missing file
+
+
+def test_cancel_wake_cancels_handle() -> None:
+    rec = _make_session("2026-06-16/1")
+    handle = MagicMock()
+    rec.wake_handle = handle
+    _cancel_wake(rec)
+    handle.cancel.assert_called_once()
+    assert rec.wake_handle is None
+    _cancel_wake(rec)  # idempotent — no error when already None
+
+
+async def _run_spawn_capturing_loop(
+    tmp_path: Path,
+    *,
+    wakeup_enabled: bool,
+    returncode: int,
+    wake_fields: dict[str, object] | None,
+    queue_inbox: bool = False,
+) -> tuple[dict[str, SessionRecord], MagicMock, str]:
+    """Drive a single spawn_engineer run with a fake event loop so call_later is observable.
+
+    Returns (sessions, fake_loop, session_ref). When wake_fields is given, a wake-request file is
+    pre-written at the session's wake path (simulating the agent having called orcai-wake).
+    """
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    session_ref = f"{date_str}/1"
+    if wake_fields is not None:
+        _write_wake(_wake_path_for(str(tmp_path), session_ref), **wake_fields)
+
+    project = make_project(workspace=str(tmp_path), wakeup_enabled=wakeup_enabled)
+    semaphore = asyncio.Semaphore(2)
+    sessions: dict[str, SessionRecord] = {}
+    session_by_thread: dict[str, str] = {}
+    session_counter: dict[str, int] = {}
+    slack_client = AsyncMock()
+
+    fake_loop = MagicMock()
+    fake_loop.call_later.return_value = MagicMock(name="timer-handle")
+    exec_calls: list[int] = []
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        exec_calls.append(1)
+        # Queue a follow-up only during the FIRST run, so the run drains exactly once (queuing on
+        # every exec would loop the drain forever).
+        if queue_inbox and len(exec_calls) == 1 and sessions:
+            rec = next(iter(sessions.values()))
+            _append_to_inbox(rec.inbox_path, "U001", "follow up", "ts-2")
+        return _make_proc(_stream_json_with_session("done", "uuid-w"), returncode=returncode)
+
+    with (
+        patch("router.router.asyncio.create_subprocess_exec", side_effect=fake_exec),
+        patch("router.router.asyncio.get_running_loop", return_value=fake_loop),
+    ):
+        await spawn_engineer(
+            project,
+            "do something",
+            "C001",
+            "ts1",
+            slack_client,
+            semaphore,
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+    return sessions, fake_loop, session_ref
+
+
+async def test_spawn_arms_wakeup_when_requested(tmp_path: Path) -> None:
+    sessions, fake_loop, session_ref = await _run_spawn_capturing_loop(
+        tmp_path,
+        wakeup_enabled=True,
+        returncode=0,
+        wake_fields={"delay_seconds": 1200, "reason": "poll", "prompt": "resume me"},
+    )
+    rec = sessions[session_ref]
+    assert rec.state == "idle"
+    assert rec.wake_handle is fake_loop.call_later.return_value
+    fake_loop.call_later.assert_called_once()
+    delay, callback, ref_arg, prompt_arg = fake_loop.call_later.call_args.args
+    assert delay == 1200
+    assert ref_arg == session_ref
+    assert prompt_arg == "resume me"
+    # wake file claimed
+    assert not os.path.exists(_wake_path_for(str(tmp_path), session_ref))
+
+
+async def test_spawn_wakeup_uses_default_prompt_when_blank(tmp_path: Path) -> None:
+    sessions, fake_loop, session_ref = await _run_spawn_capturing_loop(
+        tmp_path,
+        wakeup_enabled=True,
+        returncode=0,
+        wake_fields={"delay_seconds": 600, "reason": "", "prompt": ""},
+    )
+    _, _, _, prompt_arg = fake_loop.call_later.call_args.args
+    assert prompt_arg == DEFAULT_WAKE_PROMPT
+
+
+async def test_spawn_wakeup_clamps_low_delay(tmp_path: Path) -> None:
+    _, fake_loop, _ = await _run_spawn_capturing_loop(
+        tmp_path, wakeup_enabled=True, returncode=0, wake_fields={"delay_seconds": 5}
+    )
+    assert fake_loop.call_later.call_args.args[0] == WAKE_MIN_SECONDS
+
+
+async def test_spawn_wakeup_clamps_high_delay(tmp_path: Path) -> None:
+    _, fake_loop, _ = await _run_spawn_capturing_loop(
+        tmp_path, wakeup_enabled=True, returncode=0, wake_fields={"delay_seconds": 99999}
+    )
+    assert fake_loop.call_later.call_args.args[0] == WAKE_MAX_SECONDS
+
+
+async def test_spawn_no_wakeup_when_disabled(tmp_path: Path) -> None:
+    # Even though a wake file exists on disk, a non-wakeup agent never provisions ORCAI_WAKE,
+    # so the arm path is dead.
+    sessions, fake_loop, session_ref = await _run_spawn_capturing_loop(
+        tmp_path, wakeup_enabled=False, returncode=0, wake_fields={"delay_seconds": 1200}
+    )
+    fake_loop.call_later.assert_not_called()
+    assert sessions[session_ref].wake_handle is None
+
+
+async def test_spawn_no_wakeup_on_failure(tmp_path: Path) -> None:
+    sessions, fake_loop, session_ref = await _run_spawn_capturing_loop(
+        tmp_path, wakeup_enabled=True, returncode=1, wake_fields={"delay_seconds": 1200}
+    )
+    fake_loop.call_later.assert_not_called()
+    assert sessions[session_ref].wake_handle is None
+
+
+async def test_spawn_no_wakeup_when_no_request(tmp_path: Path) -> None:
+    sessions, fake_loop, session_ref = await _run_spawn_capturing_loop(
+        tmp_path, wakeup_enabled=True, returncode=0, wake_fields=None
+    )
+    fake_loop.call_later.assert_not_called()
+    assert sessions[session_ref].wake_handle is None
+
+
+async def test_spawn_no_wakeup_when_draining(tmp_path: Path) -> None:
+    # A message queued during the run forces a drain (resume); the turn's wake request is
+    # discarded, and the drain run leaves no new request → no wakeup is ever armed.
+    sessions, fake_loop, session_ref = await _run_spawn_capturing_loop(
+        tmp_path,
+        wakeup_enabled=True,
+        returncode=0,
+        wake_fields={"delay_seconds": 1200},
+        queue_inbox=True,
+    )
+    fake_loop.call_later.assert_not_called()
+    rec = sessions[session_ref]
+    assert rec.state == "idle"  # drained to completion
+    assert rec.wake_handle is None
+    assert not os.path.exists(_wake_path_for(str(tmp_path), session_ref))  # stale request cleared
+
+
+async def test_auto_resume_cancels_pending_wakeup() -> None:
+    """A real Slack reply that auto-resumes an idle session cancels its armed wakeup."""
+    channel_map = {"C001": make_project(name="proj", platform="slack")}
+    session_ref = "2026-04-05/1"
+    rec = _make_session(session_ref)
+    handle = MagicMock()
+    rec.wake_handle = handle
+    sessions = {session_ref: rec}
+    session_by_thread = {"C001:ts-root": session_ref}
+    session_counter: dict[str, int] = {}
+    seen_ts: deque[str] = deque(maxlen=1000)
+    tasks: set[asyncio.Task[None]] = set()
+    slack_client = AsyncMock()
+    semaphore = asyncio.Semaphore(3)
+
+    event = {
+        "channel": "C001",
+        "ts": "ts-reply",
+        "thread_ts": "ts-root",
+        "user": "U001",
+        "text": "<@U_SELF> any update?",
+    }
+
+    with (
+        patch("router.router.spawn_engineer", new_callable=AsyncMock) as mock_spawn,
+        patch("router.router.asyncio.create_task", side_effect=_mock_create_task),
+    ):
+        await _try_route_event(
+            event,
+            event,
+            channel_map,
+            "B_SELF",
+            "U_SELF",
+            slack_client,
+            semaphore,
+            tasks,
+            seen_ts,
+            {},
+            sessions=sessions,
+            session_by_thread=session_by_thread,
+            session_counter=session_counter,
+        )
+
+    handle.cancel.assert_called_once()
+    assert rec.wake_handle is None
+    mock_spawn.assert_called_once()
+    assert mock_spawn.call_args.kwargs["resume_session_id"] == "uuid-resume"
